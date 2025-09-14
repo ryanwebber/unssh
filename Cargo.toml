@@ -1,0 +1,12 @@
+[package]
+name = "unssh"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.99"
+clap = { version = "4.5.47", features = ["derive"] }
+smol = "2.0.2"
+tiny_id = "0.1.6"
+tracing = "0.1.41"
+tracing-subscriber = "0.3.20"

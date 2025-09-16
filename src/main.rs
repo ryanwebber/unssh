@@ -1,7 +1,9 @@
 use clap::{Args, Parser, Subcommand, command};
 
+mod id;
 mod logging;
 mod server;
+mod transport;
 
 /// A dodgy SSH server that you shouldn't use
 #[derive(Parser, Debug)]

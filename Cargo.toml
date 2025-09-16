@@ -3,10 +3,16 @@ name = "unssh"
 version = "0.1.0"
 edition = "2024"
 
+
 [dependencies]
 anyhow = "1.0.99"
 clap = { version = "4.5.47", features = ["derive"] }
+ed25519-dalek = "2.2.0"
+hex = "0.4.3"
+num-bigint = "0.4.6"
+num-traits = "0.2.19"
+rand = "0.6.4"
+sha2 = "0.10.9"
 smol = "2.0.2"
-tiny_id = "0.1.6"
 tracing = "0.1.41"
 tracing-subscriber = "0.3.20"

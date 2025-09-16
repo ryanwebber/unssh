@@ -1,0 +1,2 @@
+[env]
+UNSSH_TRACING_ENABLED = "1"

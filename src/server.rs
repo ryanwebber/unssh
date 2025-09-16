@@ -1,30 +1,42 @@
-use std::net::{TcpListener, TcpStream};
-
-use tiny_id::ShortCodeGenerator;
+use smol::io::{AsyncBufReadExt, AsyncWriteExt};
 use tracing::Instrument;
 
+use crate::{
+    id::ShortCodeGenerator,
+    transport::{
+        kex,
+        packet::{self},
+        stream::{CryptoState, EncryptedPacketReader, EncryptedPacketWriter},
+    },
+};
+
 pub struct Server {
-    listener: TcpListener,
-    id_generator: ShortCodeGenerator<char>,
+    listener: std::net::TcpListener,
+    id_generator: ShortCodeGenerator,
 }
 
 impl Server {
-    pub fn new(listener: TcpListener) -> Self {
+    pub fn new(listener: std::net::TcpListener) -> Self {
         Server {
             listener,
-            id_generator: ShortCodeGenerator::new_alphanumeric(8),
+            id_generator: ShortCodeGenerator::new(8),
         }
     }
 
-    pub fn run(mut self) -> anyhow::Result<()> {
+    pub fn run(self) -> anyhow::Result<()> {
         smol::block_on(async { self.run_async().await })
     }
 
-    async fn run_async(&mut self) -> anyhow::Result<()> {
+    async fn run_async(mut self) -> anyhow::Result<()> {
         tracing::info!("Server running on {:?}", self.listener.local_addr()?);
+        let async_listener = {
+            let asyncified = smol::Async::new(self.listener)?;
+            smol::net::TcpListener::from(asyncified)
+        };
+
         loop {
-            let (stream, addr) = self.listener.accept()?;
-            let id = self.id_generator.next_string();
+            let (stream, addr) = async_listener.accept().await?;
+            let id = self.id_generator.next();
             let span = tracing::info_span!("client", id = %id, addr = %addr);
 
             tracing::info!("Accepted connection from {} with id: {}", addr, id);
@@ -48,11 +60,68 @@ impl Connection {
         Connection
     }
 
-    async fn handle(&self, _stream: TcpStream) -> anyhow::Result<()> {
+    async fn handle(&self, mut stream: smol::net::TcpStream) -> anyhow::Result<()> {
         tracing::info!("Handling connection");
 
-        // TODO: Implement SSH protocol handling here
+        let client_banner = {
+            let mut reader = smol::io::BufReader::new(stream.clone());
+            let mut line = String::new();
+            reader.read_line(&mut line).await?;
+            line
+        };
 
-        Ok(())
+        tracing::info!("Client banner received: {:?}", client_banner.trim_end());
+
+        let server_banner = format!(
+            "SSH-2.0-{}_{}\r\n",
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION")
+        );
+
+        stream.write_all(server_banner.as_bytes()).await?;
+
+        stream.flush().await?;
+
+        // TODO: This cannot be right, surely this is not secure?
+        let mut rng = rand::rngs::OsRng::new()?;
+        let mut crypto_state = CryptoState::null();
+
+        let mut reader = EncryptedPacketReader::new(stream.clone());
+        let mut writer = EncryptedPacketWriter::new(stream.clone());
+
+        // Algorithm negotiation
+        {
+            let server_kexinit = kex::default_kex_init();
+            let server_kexinit_bytes = writer
+                .write_packet(&server_kexinit, &mut crypto_state)
+                .await?;
+
+            let (client_kexinit, client_kexinit_bytes) =
+                reader.read_packet_and_data(&mut crypto_state).await?;
+
+            let kex_context = kex::KexContext {
+                client_version: client_banner.trim_end().to_string(),
+                server_version: server_banner.trim_end().to_string(),
+                client_kexinit: client_kexinit_bytes,
+                server_kexinit: server_kexinit_bytes,
+            };
+
+            kex::perform_key_exchange(
+                &mut rng,
+                &mut crypto_state,
+                &kex_context,
+                &server_kexinit,
+                &client_kexinit,
+                &mut reader,
+                &mut writer,
+            )
+            .await?;
+        }
+
+        // Main packet processing loop
+        loop {
+            // For now, just break out of the loop
+            anyhow::bail!("Packet handling not implemented");
+        }
     }
 }

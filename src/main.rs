@@ -1,5 +1,8 @@
+use std::{path::PathBuf, sync::Arc};
+
 use clap::{Args, Parser, Subcommand, command};
 
+mod config;
 mod id;
 mod logging;
 mod server;
@@ -19,6 +22,9 @@ enum Command {
     Run {
         #[command(flatten)]
         connection_options: ConnectionOptions,
+
+        #[command(flatten)]
+        auth_options: AuthOptions,
     },
 }
 
@@ -33,6 +39,13 @@ struct ConnectionOptions {
     port: u16,
 }
 
+#[derive(Debug, Args)]
+struct AuthOptions {
+    /// Public key file for the server to use
+    #[arg(short, long)]
+    public_key: PathBuf,
+}
+
 fn main() {
     if let Err(e) = logging::init() {
         eprintln!("Failed to initialize logging: {e}");
@@ -42,11 +55,18 @@ fn main() {
 
     tracing::info!("Starting {} with args: {args:#?}", env!("CARGO_PKG_NAME"));
     match args.command {
-        Command::Run { connection_options } => {
+        Command::Run {
+            connection_options,
+            auth_options,
+        } => {
             let addr = format!("{}:{}", connection_options.address, connection_options.port);
             match std::net::TcpListener::bind(&addr) {
                 Ok(listener) => {
-                    let server = server::Server::new(listener);
+                    let config = Arc::new(config::Config {
+                        host_key_path: auth_options.public_key,
+                    });
+
+                    let server = server::Server::new(listener, config);
                     if let Err(e) = server.run() {
                         tracing::error!("Server error: {e}");
                     }

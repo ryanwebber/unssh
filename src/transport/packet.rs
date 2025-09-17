@@ -53,6 +53,28 @@ impl PacketDecodable for Ignore {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+pub struct Debug {
+    pub always_display: bool,
+    pub message: String,
+    pub language_tag: String,
+}
+
+impl Packet for Debug {
+    const MESSAGE_NUMBER: u8 = 4;
+    const MESSAGE_NAME: &'static str = "SSH_MSG_DEBUG";
+}
+
+impl PacketDecodable for Debug {
+    fn read_from<'a>(decoder: &mut PacketDecoder<'a>) -> anyhow::Result<Self> {
+        Ok(Self {
+            always_display: decoder.read_u8()? != 0,
+            message: decoder.read_string()?,
+            language_tag: decoder.read_string()?,
+        })
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
 pub struct ServiceRequest {
     pub service_name: String,
 }
@@ -218,7 +240,7 @@ impl PacketEncodable for KexDhReply {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct NewKeys;
 
 impl Packet for NewKeys {
@@ -235,6 +257,61 @@ impl PacketEncodable for NewKeys {
 impl PacketDecodable for NewKeys {
     fn read_from<'a>(_: &mut PacketDecoder<'a>) -> anyhow::Result<Self> {
         Ok(NewKeys)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct UserAuthRequest {
+    pub user_name: String,
+    pub service_name: String,
+    pub method_name: String,
+}
+
+impl Packet for UserAuthRequest {
+    const MESSAGE_NUMBER: u8 = 50;
+    const MESSAGE_NAME: &'static str = "SSH_MSG_USERAUTH_REQUEST";
+}
+
+impl PacketDecodable for UserAuthRequest {
+    fn read_from<'a>(decoder: &mut PacketDecoder<'a>) -> anyhow::Result<Self> {
+        Ok(Self {
+            user_name: decoder.read_string()?,
+            service_name: decoder.read_string()?,
+            method_name: decoder.read_string()?,
+        })
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct UserAuthBanner {
+    pub message: String,
+    pub language_tag: String,
+}
+
+impl Packet for UserAuthBanner {
+    const MESSAGE_NUMBER: u8 = 53;
+    const MESSAGE_NAME: &'static str = "SSH_MSG_USERAUTH_BANNER";
+}
+
+impl PacketEncodable for UserAuthBanner {
+    fn write_into(&self, encoder: &mut PacketEncoder) -> anyhow::Result<()> {
+        encoder.write_string(&self.message)?;
+        encoder.write_string(&self.language_tag)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct UserAuthSuccess;
+
+impl Packet for UserAuthSuccess {
+    const MESSAGE_NUMBER: u8 = 52;
+    const MESSAGE_NAME: &'static str = "SSH_MSG_USERAUTH_SUCCESS";
+}
+
+impl PacketEncodable for UserAuthSuccess {
+    fn write_into(&self, _: &mut PacketEncoder) -> anyhow::Result<()> {
+        Ok(())
     }
 }
 

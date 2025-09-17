@@ -1,7 +1,9 @@
-use crate::transport::{
-    crypto::Cipher,
-    packet::KexInit,
-    stream::{EncryptedPacketReader, EncryptedPacketWriter},
+use crate::{
+    config::Config,
+    transport::{
+        packet::KexInit,
+        stream::{EncryptedPacketReader, EncryptedPacketWriter},
+    },
 };
 
 mod diffie_hellman_group14_sha256;
@@ -14,6 +16,7 @@ pub struct KexContext {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct Algorithms {
     pub kex_algorithm: String,
     pub server_host_key_algorithm: String,
@@ -45,6 +48,7 @@ pub fn default_kex_init() -> KexInit {
 pub async fn perform_key_exchange(
     rng: &mut (impl rand::CryptoRng + rand::RngCore),
     crypto: &mut crate::transport::stream::CryptoState,
+    config: &Config,
     kex_context: &KexContext,
     server_kex: &KexInit,
     client_kex: &KexInit,
@@ -54,12 +58,33 @@ pub async fn perform_key_exchange(
     let negotiated_algorithms = negotiate(&server_kex, &client_kex)?;
     tracing::info!("Negotiated algorithms: {:#?}", negotiated_algorithms);
 
+    let host_key = {
+        let contents = std::fs::read_to_string(&config.host_key_path).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to read host key at path {}: {}",
+                config.host_key_path.display(),
+                e
+            )
+        })?;
+
+        let public_key = ssh_key::PublicKey::from_openssh(&contents)?;
+        let Some(key_data) = public_key.key_data().ed25519() else {
+            anyhow::bail!(
+                "Expected an ed25519 host key, got {}",
+                public_key.algorithm()
+            );
+        };
+
+        key_data.as_ref().to_vec()
+    };
+
     match negotiated_algorithms.kex_algorithm.as_str() {
         "diffie-hellman-group14-sha256" => {
             diffie_hellman_group14_sha256::perform_key_exchange(
                 rng,
                 crypto,
                 kex_context,
+                &host_key,
                 reader,
                 writer,
             )

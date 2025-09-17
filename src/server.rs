@@ -1,9 +1,13 @@
+use std::sync::Arc;
+
 use smol::io::{AsyncBufReadExt, AsyncWriteExt};
 use tracing::Instrument;
 
 use crate::{
+    config::Config,
     id::ShortCodeGenerator,
     transport::{
+        buffer::Packet,
         kex,
         packet::{self},
         stream::{CryptoState, EncryptedPacketReader, EncryptedPacketWriter},
@@ -11,13 +15,15 @@ use crate::{
 };
 
 pub struct Server {
+    config: Arc<Config>,
     listener: std::net::TcpListener,
     id_generator: ShortCodeGenerator,
 }
 
 impl Server {
-    pub fn new(listener: std::net::TcpListener) -> Self {
+    pub fn new(listener: std::net::TcpListener, config: Arc<Config>) -> Self {
         Server {
+            config,
             listener,
             id_generator: ShortCodeGenerator::new(8),
         }
@@ -41,8 +47,9 @@ impl Server {
 
             tracing::info!("Accepted connection from {} with id: {}", addr, id);
 
+            let config = self.config.clone();
             let future = async {
-                let connection = Connection::new();
+                let connection = Connection::new(config);
                 if let Err(e) = connection.handle(stream).await {
                     tracing::error!("Error handling connection: {e}");
                 }
@@ -53,11 +60,13 @@ impl Server {
     }
 }
 
-struct Connection;
+struct Connection {
+    config: Arc<Config>,
+}
 
 impl Connection {
-    fn new() -> Self {
-        Connection
+    fn new(config: Arc<Config>) -> Self {
+        Connection { config }
     }
 
     async fn handle(&self, mut stream: smol::net::TcpStream) -> anyhow::Result<()> {
@@ -110,6 +119,7 @@ impl Connection {
             kex::perform_key_exchange(
                 &mut rng,
                 &mut crypto_state,
+                self.config.as_ref(),
                 &kex_context,
                 &server_kexinit,
                 &client_kexinit,
@@ -125,40 +135,38 @@ impl Connection {
 
             let packet = reader.read_some_packet(&mut crypto_state).await?;
             match packet.message_number()? {
-                1 => {
-                    let disconnect: packet::Disconnect = packet.try_unpack()?;
-                    tracing::info!("Received client disconnect packet: {:#?}", disconnect);
+                packet::Disconnect::MESSAGE_NUMBER => {
+                    let msg: packet::Disconnect = packet.try_unpack()?;
+                    tracing::info!("Received client disconnect packet: {:#?}", msg);
                     return Ok(());
                 }
-                2 => {
-                    let ignore: packet::Ignore = packet.try_unpack()?;
-                    tracing::info!("Received ignore packet: {:#?}", ignore);
+                packet::Ignore::MESSAGE_NUMBER => {
+                    let msg: packet::Ignore = packet.try_unpack()?;
+                    tracing::info!("Received ignore packet: {:#?}", msg);
                 }
-                5 => {
-                    let service_request: packet::ServiceRequest = packet.try_unpack()?;
-                    tracing::info!("Received service request: {:#?}", service_request);
+                packet::Debug::MESSAGE_NUMBER => {
+                    let msg: packet::Debug = packet.try_unpack()?;
+                    tracing::info!("Received debug packet: {:#?}", msg);
+                }
+                packet::ServiceRequest::MESSAGE_NUMBER => {
+                    let msg: packet::ServiceRequest = packet.try_unpack()?;
+                    tracing::info!("Received service request: {:#?}", msg);
 
-                    match service_request.service_name.as_str() {
+                    match msg.service_name.as_str() {
                         "ssh-userauth" => {
                             let service_accept = packet::ServiceAccept {
-                                service_name: service_request.service_name.clone(),
+                                service_name: msg.service_name.clone(),
                             };
                             writer
                                 .write_packet(&service_accept, &mut crypto_state)
                                 .await?;
                         }
                         _ => {
-                            tracing::warn!(
-                                "Unsupported service request: {}",
-                                service_request.service_name
-                            );
+                            tracing::warn!("Unsupported service request: {}", msg.service_name);
 
                             let disconnect = packet::Disconnect {
                                 reason_code: 3,
-                                description: format!(
-                                    "Unsupported service: {}",
-                                    service_request.service_name
-                                ),
+                                description: format!("Unsupported service: {}", msg.service_name),
                                 language_tag: "".to_string(),
                             };
 
@@ -166,6 +174,25 @@ impl Connection {
                             return Ok(());
                         }
                     }
+                }
+                packet::UserAuthRequest::MESSAGE_NUMBER => {
+                    let msg: packet::UserAuthRequest = packet.try_unpack()?;
+                    tracing::info!("Received user auth request: {:#?}", msg);
+
+                    writer
+                        .write_packet(
+                            &packet::UserAuthBanner {
+                                message: "Welcome to the unssh server!\n".to_string(),
+                                language_tag: "".to_string(),
+                            },
+                            &mut crypto_state,
+                        )
+                        .await?;
+
+                    // For now, we accept zero authentication and just auth everyone
+                    writer
+                        .write_packet(&packet::UserAuthSuccess, &mut crypto_state)
+                        .await?;
                 }
                 _ => {
                     tracing::info!(

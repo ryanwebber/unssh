@@ -87,11 +87,12 @@ pub async fn perform_key_exchange(
     rng: &mut (impl rand::CryptoRng + rand::RngCore),
     crypto: &mut CryptoState,
     kex_context: &KexContext,
+    host_key: &[u8],
     reader: &mut EncryptedPacketReader<impl smol::io::AsyncRead + Clone + Unpin>,
     writer: &mut EncryptedPacketWriter<impl smol::io::AsyncWrite + Clone + Unpin>,
 ) -> anyhow::Result<()> {
     // 1. Create a signing key for the server host (Ed25519)
-    let mut server_host_key = generate_signing_key(rng)?;
+    let mut server_host_key = generate_signing_key(host_key)?;
     let server_verifying_key: VerifyingKey = server_host_key.verifying_key();
 
     // 2. Read KEXDH_INIT
@@ -198,12 +199,16 @@ pub async fn perform_key_exchange(
     Ok(())
 }
 
-fn generate_signing_key<R: rand::CryptoRng + rand::RngCore>(
-    rng: &mut R,
-) -> anyhow::Result<ed25519_dalek::SigningKey> {
+fn generate_signing_key(host_key: &[u8]) -> anyhow::Result<ed25519_dalek::SigningKey> {
     let mut secret_key = [0u8; ed25519_dalek::SECRET_KEY_LENGTH];
-    rng.try_fill_bytes(&mut secret_key)
-        .map_err(|e| anyhow::anyhow!("RNG error: {:?}", e))?;
+    if host_key.len() != ed25519_dalek::SECRET_KEY_LENGTH {
+        return Err(anyhow::anyhow!(
+            "Invalid host key length: expected {} bytes, got {} bytes",
+            ed25519_dalek::SECRET_KEY_LENGTH,
+            host_key.len()
+        ));
+    }
 
+    secret_key.copy_from_slice(host_key);
     Ok(SigningKey::from_bytes(&secret_key))
 }

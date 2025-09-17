@@ -1,7 +1,74 @@
 use crate::transport::{
     buffer::{Packet, PacketDecodable, PacketDecoder, PacketEncodable, PacketEncoder},
-    common::{ByteString, MultiPrecisionInteger, NameList, OwnedNameList},
+    common::{ByteString, MultiPrecisionInteger, NameList, OwnedByteString, OwnedNameList},
 };
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Disconnect {
+    pub reason_code: u32,
+    pub description: String,
+    pub language_tag: String,
+}
+
+impl Packet for Disconnect {
+    const MESSAGE_NUMBER: u8 = 1;
+    const MESSAGE_NAME: &'static str = "SSH_MSG_DISCONNECT";
+}
+
+impl PacketEncodable for Disconnect {
+    fn write_into(&self, encoder: &mut PacketEncoder) -> anyhow::Result<()> {
+        // Reason code 11 = SSH_DISCONNECT_BY_APPLICATION
+        encoder.write_u32(self.reason_code);
+        encoder.write_string(&self.description)?;
+        encoder.write_string(&self.language_tag)?;
+        Ok(())
+    }
+}
+
+impl PacketDecodable for Disconnect {
+    fn read_from<'a>(decoder: &mut PacketDecoder<'a>) -> anyhow::Result<Self> {
+        Ok(Self {
+            reason_code: decoder.read_u32()?,
+            description: decoder.read_string()?,
+            language_tag: decoder.read_string()?,
+        })
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Ignore {
+    pub data: Vec<u8>,
+}
+
+impl Packet for Ignore {
+    const MESSAGE_NUMBER: u8 = 2;
+    const MESSAGE_NAME: &'static str = "SSH_MSG_IGNORE";
+}
+
+impl PacketDecodable for Ignore {
+    fn read_from<'a>(decoder: &mut PacketDecoder<'a>) -> anyhow::Result<Self> {
+        let data = decoder.read::<OwnedByteString>()?.into_inner();
+        Ok(Self { data })
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct ServiceRequest {
+    pub service_name: String,
+}
+
+impl Packet for ServiceRequest {
+    const MESSAGE_NUMBER: u8 = 5;
+    const MESSAGE_NAME: &'static str = "SSH_MSG_SERVICE_REQUEST";
+}
+
+impl PacketDecodable for ServiceRequest {
+    fn read_from<'a>(decoder: &mut PacketDecoder<'a>) -> anyhow::Result<Self> {
+        Ok(Self {
+            service_name: decoder.read_string()?,
+        })
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct KexInit {

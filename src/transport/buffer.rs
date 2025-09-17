@@ -1,5 +1,7 @@
 use std::vec;
 
+use crate::transport::common::{ByteString, OwnedByteString};
+
 pub trait Packet {
     const MESSAGE_NUMBER: u8;
     const MESSAGE_NAME: &'static str;
@@ -66,6 +68,10 @@ impl PacketEncoder {
         self.buffer.extend_from_slice(bytes);
     }
 
+    pub fn write_string(&mut self, value: &str) -> anyhow::Result<()> {
+        self.write(&ByteString::new(value.as_bytes()))
+    }
+
     pub fn write_random_bytes(&mut self, len: usize) {
         // TODO: Random bytes
         let buf = vec![0u8; len];
@@ -124,6 +130,11 @@ impl<'a> PacketDecoder<'a> {
         let remaining = self.buffer;
         self.buffer = &[];
         remaining
+    }
+
+    pub fn read_string(&mut self) -> anyhow::Result<String> {
+        let bytes = self.read::<OwnedByteString>()?.into_inner();
+        Ok(String::from_utf8(bytes)?)
     }
 
     pub fn skip_bytes(&mut self, len: usize) -> anyhow::Result<()> {

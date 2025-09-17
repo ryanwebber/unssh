@@ -124,10 +124,39 @@ impl Connection {
             tracing::info!("Waiting for packet...");
 
             let packet = reader.read_some_packet(&mut crypto_state).await?;
-            tracing::info!("Received packet with {} bytes", packet.into_bytes().len());
+            match packet.message_number()? {
+                1 => {
+                    let disconnect: packet::Disconnect = packet.try_unpack()?;
+                    tracing::info!("Received client disconnect packet: {:#?}", disconnect);
+                    return Ok(());
+                }
+                2 => {
+                    let ignore: packet::Ignore = packet.try_unpack()?;
+                    tracing::info!("Received ignore packet: {:#?}", ignore);
+                }
+                5 => {
+                    let service_request: packet::ServiceRequest = packet.try_unpack()?;
+                    tracing::info!("Received service request: {:#?}", service_request);
+                    anyhow::bail!("Service requests not supported yet");
+                }
+                _ => {
+                    tracing::info!(
+                        "Received unhandled packet type: {}",
+                        packet.message_number()?
+                    );
 
-            // For now, just break out of the loop
-            anyhow::bail!("Packet handling not implemented");
+                    // Write a disconnect and close the connection
+                    let disconnect = packet::Disconnect {
+                        reason_code: 2,
+                        description: "Protocol error: unhandled packet type".to_string(),
+                        language_tag: "".to_string(),
+                    };
+
+                    writer.write_packet(&disconnect, &mut crypto_state).await?;
+
+                    anyhow::bail!("Unhandled packet type: {}", packet.message_number()?);
+                }
+            }
         }
     }
 }

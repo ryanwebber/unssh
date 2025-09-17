@@ -115,13 +115,6 @@ where
             payload.message_number()?
         );
 
-        match payload.message_number() {
-            Ok(1) => {
-                anyhow::bail!("Received DISCONNECT");
-            }
-            _ => {}
-        }
-
         crypto.seq_in = crypto.seq_in.wrapping_add(1);
 
         Ok(payload)

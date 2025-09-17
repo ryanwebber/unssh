@@ -97,6 +97,33 @@ impl<'a> PacketEncodable for ByteString<'a> {
     }
 }
 
+pub struct OwnedByteString {
+    pub bytes: Vec<u8>,
+}
+
+impl OwnedByteString {
+    pub fn into_inner(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+impl PacketDecodable for OwnedByteString {
+    fn read_from<'a>(decoder: &mut PacketDecoder<'a>) -> anyhow::Result<Self> {
+        let size = decoder.read_u32()? as usize;
+        if size > 1_000_000 {
+            anyhow::bail!(
+                "ByteString too large to decode ({} bytes, max is 1,000,000)",
+                size
+            );
+        }
+
+        let mut bytes = vec![0u8; size];
+        decoder.read_exact(&mut bytes)?;
+
+        Ok(OwnedByteString { bytes })
+    }
+}
+
 pub struct MultiPrecisionInteger {
     pub bytes: Vec<u8>,
 }

@@ -1,11 +1,12 @@
 use ed25519_dalek::{SigningKey, VerifyingKey, ed25519::signature::SignerMut};
 use num_bigint::BigUint;
 use num_traits::Num;
-use sha2::Digest;
+use sha2::{Digest, Sha256};
 
 use crate::transport::{
     buffer::{PacketDecodableExt, PacketEncodableExt},
     common::{ByteString, MultiPrecisionInteger},
+    crypto::{aes::Aes128Ctr, hmac::HmacSha256},
     kex::KexContext,
     packet::{self},
     stream::{CryptoState, EncryptedPacketReader, EncryptedPacketWriter},
@@ -49,6 +50,37 @@ fn build_ed25519_signature_blob(sig: &ed25519_dalek::Signature) -> anyhow::Resul
     inner.extend_from_slice(ByteString::new(b"ssh-ed25519").try_as_bytes()?.as_slice());
     inner.extend_from_slice(ByteString::new(&sig_bytes).try_as_bytes()?.as_slice());
     Ok(inner)
+}
+
+fn derive_key(
+    k_mpint_with_len: &[u8],
+    h: &[u8],
+    session_id: &[u8],
+    letter: u8,
+    out_len: usize,
+) -> anyhow::Result<Vec<u8>> {
+    // First round: K1 = HASH(K || H || X || session_id)
+    let mut out = {
+        let mut hasher = Sha256::new();
+        hasher.update(k_mpint_with_len);
+        hasher.update(h);
+        hasher.update(&[letter]);
+        hasher.update(session_id);
+        hasher.finalize().to_vec()
+    };
+
+    // Subsequent rounds: Ki = HASH(K || H || K1 || K2 || ... Ki-1)
+    while out.len() < out_len {
+        let mut hasher = Sha256::new();
+        hasher.update(k_mpint_with_len);
+        hasher.update(h);
+        hasher.update(&out);
+        let k_i = hasher.finalize().to_vec();
+        out.extend_from_slice(&k_i);
+    }
+
+    out.truncate(out_len);
+    Ok(out)
 }
 
 pub async fn perform_key_exchange(
@@ -124,7 +156,44 @@ pub async fn perform_key_exchange(
     writer.write_packet(&packet::NewKeys, crypto).await?;
     let _: packet::NewKeys = reader.read_packet(crypto).await?;
 
-    todo!("Send NEWKEYS and set up encryption/MAC in the crypto state");
+    // 9. Derive keys and set up encryption/MAC
+    let session_id = h.clone();
+
+    // K as mpint encoding (with 4-byte length + normalized two's complement bytes)
+    let k_mpint_with_len = MultiPrecisionInteger::from(&k).try_as_bytes()?;
+
+    let iv_c2s = derive_key(&k_mpint_with_len, &h, &session_id, b'A', 16)?;
+    let iv_s2c = derive_key(&k_mpint_with_len, &h, &session_id, b'B', 16)?;
+    let key_c2s = derive_key(&k_mpint_with_len, &h, &session_id, b'C', 16)?;
+    let key_s2c = derive_key(&k_mpint_with_len, &h, &session_id, b'D', 16)?;
+    let mac_c2s = derive_key(&k_mpint_with_len, &h, &session_id, b'E', 32)?;
+    let mac_s2c = derive_key(&k_mpint_with_len, &h, &session_id, b'F', 32)?;
+
+    crypto.set_cipher({
+        let key_pairs = crate::transport::crypto::aes::KeyPair {
+            client_to_server: crate::transport::crypto::aes::Key {
+                key: &key_c2s,
+                iv: &iv_c2s,
+            },
+            server_to_client: crate::transport::crypto::aes::Key {
+                key: &key_s2c,
+                iv: &iv_s2c,
+            },
+        };
+
+        Box::new(Aes128Ctr::new(key_pairs)?)
+    });
+
+    crypto.set_mac({
+        let mac = crate::transport::crypto::hmac::DirectionalHmacSha256 {
+            client_to_server: HmacSha256::new(&mac_c2s),
+            server_to_client: HmacSha256::new(&mac_s2c),
+        };
+
+        Box::new(mac)
+    });
+
+    tracing::info!("Key exchange complete");
 
     Ok(())
 }

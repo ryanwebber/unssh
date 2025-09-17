@@ -13,6 +13,10 @@ impl Cipher for NullCipher {
         8
     }
 
+    fn name(&self) -> &'static str {
+        "null"
+    }
+
     fn encrypt(&mut self, _: &mut [u8]) {
         // No-op
     }
@@ -35,8 +39,12 @@ impl Mac for NullMac {
         0
     }
 
-    fn compute(&mut self, _seq_num: u32, _packet: &[u8]) -> Vec<u8> {
-        Vec::new()
+    fn name(&self) -> &'static str {
+        "null"
+    }
+
+    fn compute(&mut self, _seq_num: u32, _packet: &[u8]) -> anyhow::Result<Vec<u8>> {
+        Ok(Vec::new())
     }
 
     fn verify(&mut self, _seq_num: u32, _packet: &[u8], _mac: &[u8]) -> bool {

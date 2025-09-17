@@ -1,4 +1,5 @@
 use crate::transport::{
+    crypto::Cipher,
     packet::KexInit,
     stream::{EncryptedPacketReader, EncryptedPacketWriter},
 };
@@ -30,8 +31,8 @@ pub fn default_kex_init() -> KexInit {
         server_host_key_algorithms: vec![String::from("ssh-ed25519")],
         encryption_algorithms_client_to_server: vec![String::from("aes128-ctr")],
         encryption_algorithms_server_to_client: vec![String::from("aes128-ctr")],
-        mac_algorithms_client_to_server: vec![String::from("hmac-sha1")],
-        mac_algorithms_server_to_client: vec![String::from("hmac-sha1")],
+        mac_algorithms_client_to_server: vec![String::from("hmac-sha2-256")],
+        mac_algorithms_server_to_client: vec![String::from("hmac-sha2-256")],
         compression_algorithms_client_to_server: vec![String::from("none")],
         compression_algorithms_server_to_client: vec![String::from("none")],
         languages_client_to_server: vec![],

@@ -1,14 +1,19 @@
 mod null;
 
+pub mod aes;
+pub mod hmac;
+
 pub trait Cipher: Send {
     fn block_size(&self) -> usize;
+    fn name(&self) -> &'static str;
     fn encrypt(&mut self, buf: &mut [u8]);
     fn decrypt(&mut self, buf: &mut [u8]);
 }
 
 pub trait Mac: Send {
     fn len(&self) -> usize;
-    fn compute(&mut self, seq_num: u32, packet: &[u8]) -> Vec<u8>;
+    fn name(&self) -> &'static str;
+    fn compute(&mut self, seq_num: u32, packet: &[u8]) -> anyhow::Result<Vec<u8>>;
     fn verify(&mut self, seq_num: u32, packet: &[u8], mac: &[u8]) -> bool;
 }
 

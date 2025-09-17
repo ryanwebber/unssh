@@ -96,8 +96,9 @@ impl Connection {
                 .write_packet(&server_kexinit, &mut crypto_state)
                 .await?;
 
-            let (client_kexinit, client_kexinit_bytes) =
-                reader.read_packet_and_data(&mut crypto_state).await?;
+            let client_response = reader.read_some_packet(&mut crypto_state).await?;
+            let client_kexinit: packet::KexInit = client_response.try_unpack()?;
+            let client_kexinit_bytes = client_response.into_bytes();
 
             let kex_context = kex::KexContext {
                 client_version: client_banner.trim_end().to_string(),
@@ -120,6 +121,11 @@ impl Connection {
 
         // Main packet processing loop
         loop {
+            tracing::info!("Waiting for packet...");
+
+            let packet = reader.read_some_packet(&mut crypto_state).await?;
+            tracing::info!("Received packet with {} bytes", packet.into_bytes().len());
+
             // For now, just break out of the loop
             anyhow::bail!("Packet handling not implemented");
         }

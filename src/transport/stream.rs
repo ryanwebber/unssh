@@ -10,7 +10,9 @@ use crate::transport::{
 pub struct CryptoState {
     cipher: Box<dyn Cipher>,
     mac: Box<dyn Mac>,
-    seq_num: u32,
+    // SSH maintains independent sequence numbers per direction
+    seq_in: u32,
+    seq_out: u32,
 }
 
 impl CryptoState {
@@ -19,15 +21,18 @@ impl CryptoState {
         Self {
             cipher,
             mac,
-            seq_num: 0,
+            seq_in: 0,
+            seq_out: 0,
         }
     }
 
     pub fn set_cipher(&mut self, cipher: Box<dyn Cipher>) {
+        tracing::info!("Updating cipher to {}", cipher.name());
         self.cipher = cipher;
     }
 
     pub fn set_mac(&mut self, mac: Box<dyn Mac>) {
+        tracing::info!("Updating MAC to {}", mac.name());
         self.mac = mac;
     }
 }
@@ -46,42 +51,49 @@ where
         }
     }
 
-    pub async fn read_packet_and_data<T: Packet + PacketDecodable + Debug>(
+    pub async fn read_some_packet(
         &mut self,
         crypto: &mut CryptoState,
-    ) -> anyhow::Result<(T, Vec<u8>)> {
-        let block_size = crypto.cipher.block_size();
+    ) -> anyhow::Result<PacketPayload> {
+        // CTR mode: read exactly 4-byte header and decrypt it to get packet_length
+        let mut header = [0u8; 4];
+        self.inner.read_exact(&mut header).await?;
+        let header_cipher = header;
+        crypto.cipher.decrypt(&mut header);
+        let header_plain = header;
+        let packet_length = u32::from_be_bytes(header_plain) as usize;
 
-        // Read and decrypt the first cipher block
-        let mut first_block = vec![0u8; block_size];
-        self.inner.read_exact(&mut first_block).await?;
-        crypto.cipher.decrypt(&mut first_block);
+        // Heuristic: if decrypted length is implausible but raw header looks plausible,
+        // negotiation may have selected an ETM variant unexpectedly.
+        let raw_len = u32::from_be_bytes(header_cipher) as usize;
+        if (packet_length < 1 || packet_length > 35000) && (1..=35000).contains(&raw_len) {
+            tracing::warn!(
+                "Decrypted packet_length={} looks invalid but raw header={} looks plausible; \n\
+                 check MAC negotiation (ETM vs non-ETM).",
+                packet_length,
+                raw_len
+            );
+        }
 
-        // First 4 bytes are packet_length
-        let packet_length = u32::from_be_bytes(first_block[..4].try_into()?) as usize;
-
-        if packet_length < 1 {
+        if packet_length < 1 || packet_length > 35000 {
             anyhow::bail!("Invalid packet_length: {packet_length}");
         }
 
-        // We already decrypted part of the packet (block_size bytes)
-        let mut full_plain = first_block;
+        tracing::trace!("Got new packet header, length: {}", packet_length);
+        // Read body and decrypt streaming
+        let mut body = vec![0u8; packet_length];
+        self.inner.read_exact(&mut body).await?;
+        crypto.cipher.decrypt(&mut body);
 
-        // Read the rest of the packet (encrypted)
-        let remaining = packet_length + 4 - block_size; // total - what we already have
-        if remaining > 0 {
-            let mut rest = vec![0u8; remaining];
-            self.inner.read_exact(&mut rest).await?;
-            crypto.cipher.decrypt(&mut rest);
-            full_plain.extend_from_slice(&rest);
-        }
+        let mut full_plain = header.to_vec();
+        full_plain.extend_from_slice(&body);
 
         // Read and verify MAC if needed
         let mac_len = crypto.mac.len();
         if mac_len > 0 {
             let mut mac_buf = vec![0u8; mac_len];
             self.inner.read_exact(&mut mac_buf).await?;
-            if !crypto.mac.verify(crypto.seq_num, &full_plain, &mac_buf) {
+            if !crypto.mac.verify(crypto.seq_in, &full_plain, &mac_buf) {
                 anyhow::bail!("MAC verification failed");
             }
         }
@@ -94,39 +106,64 @@ where
         }
 
         let payload_data = full_plain[5..payload_end].to_vec();
-        let payload = {
-            let mut decoder = PacketDecoder::new(&payload_data);
-            let message_number = decoder.read_u8()?;
-            match message_number {
-                n if n == T::MESSAGE_NUMBER => {}
-                1 => {
-                    anyhow::bail!("Received SSH_MSG_DISCONNECT");
-                }
-                _ => {
-                    anyhow::bail!(
-                        "Invalid message number for {}: {}",
-                        T::MESSAGE_NAME,
-                        message_number
-                    );
-                }
-            }
-
-            T::read_from(&mut decoder)?
+        let payload = PacketPayload {
+            payload_bytes: payload_data,
         };
 
-        crypto.seq_num = crypto.seq_num.wrapping_add(1);
+        tracing::trace!(
+            "Read packet with message number: {}",
+            payload.message_number()?
+        );
 
-        tracing::trace!("Read packet: {:#?}", payload);
+        match payload.message_number() {
+            Ok(1) => {
+                anyhow::bail!("Received DISCONNECT");
+            }
+            _ => {}
+        }
 
-        Ok((payload, payload_data))
+        crypto.seq_in = crypto.seq_in.wrapping_add(1);
+
+        Ok(payload)
     }
 
     pub async fn read_packet<T: Packet + PacketDecodable + Debug>(
         &mut self,
         crypto: &mut CryptoState,
     ) -> anyhow::Result<T> {
-        let (packet, _) = self.read_packet_and_data(crypto).await?;
+        let payload = self.read_some_packet(crypto).await?;
+        let packet = payload.try_unpack::<T>()?;
+        tracing::trace!("Read and decoded packet: {:#?}", packet);
         Ok(packet)
+    }
+}
+
+pub struct PacketPayload {
+    payload_bytes: Vec<u8>,
+}
+
+impl PacketPayload {
+    pub fn try_unpack<T: PacketDecodable + Packet>(&self) -> anyhow::Result<T> {
+        let mut decoder = PacketDecoder::new(&self.payload_bytes);
+        let message_number = decoder.read_u8()?;
+        if message_number != T::MESSAGE_NUMBER {
+            anyhow::bail!(
+                "Invalid message number for {}: {}",
+                T::MESSAGE_NAME,
+                message_number
+            );
+        }
+
+        T::read_from(&mut decoder)
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.payload_bytes
+    }
+
+    pub fn message_number(&self) -> anyhow::Result<u8> {
+        let mut decoder = PacketDecoder::new(&self.payload_bytes);
+        decoder.read_u8()
     }
 }
 
@@ -168,11 +205,11 @@ where
             data
         };
 
-        // 2. Encrypt in place
-        crypto.cipher.encrypt(&mut packet_data);
+        // 2. Compute MAC over plaintext (RFC 4253 §6)
+        let mac = crypto.mac.compute(crypto.seq_out, &packet_data)?;
 
-        // 3. Compute MAC
-        let mac = crypto.mac.compute(crypto.seq_num, &packet_data);
+        // 3. Encrypt in place (CTR)
+        crypto.cipher.encrypt(&mut packet_data);
 
         // 4. Write cipher text + mac
         self.inner.write_all(&packet_data).await?;
@@ -180,8 +217,8 @@ where
             self.inner.write_all(&mac).await?;
         }
 
-        // 5. Increment seq_num
-        crypto.seq_num = crypto.seq_num.wrapping_add(1);
+        // 5. Increment outbound sequence number
+        crypto.seq_out = crypto.seq_out.wrapping_add(1);
 
         // 6. Flush
         self.inner.flush().await?;

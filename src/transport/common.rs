@@ -105,6 +105,21 @@ impl MultiPrecisionInteger {
     pub fn new(bytes: Vec<u8>) -> Self {
         Self { bytes }
     }
+
+    pub fn bytes_without_length_prefix(&self) -> Vec<u8> {
+        // Remove leading zeros for positive integers
+        let mut mp = self.bytes.clone();
+        while mp.len() > 0 && mp[0] == 0 {
+            mp.remove(0);
+        }
+
+        // Add leading 0 if high bit is set
+        if mp.len() > 0 && mp[0] & 0x80 != 0 {
+            mp.insert(0, 0);
+        }
+
+        mp
+    }
 }
 
 impl From<&num_bigint::BigUint> for MultiPrecisionInteger {
@@ -117,18 +132,8 @@ impl From<&num_bigint::BigUint> for MultiPrecisionInteger {
 
 impl PacketEncodable for MultiPrecisionInteger {
     fn write_into(&self, encoder: &mut PacketEncoder) -> anyhow::Result<()> {
-        // Remove leading zeros for positive integers
-        let mut mp = self.bytes.clone();
-        while mp.len() > 0 && mp[0] == 0 {
-            mp.remove(0);
-        }
-
-        // Add leading 0 if high bit is set
-        if mp.len() > 0 && mp[0] & 0x80 != 0 {
-            mp.insert(0, 0);
-        }
-
-        let bytestring = ByteString::new(&mp);
+        let bytes = self.bytes_without_length_prefix();
+        let bytestring = ByteString::new(&bytes);
         bytestring.write_into(encoder)?;
 
         Ok(())

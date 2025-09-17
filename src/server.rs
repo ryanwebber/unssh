@@ -129,10 +129,10 @@ impl Connection {
             .await?;
         }
 
+        tracing::info!("Beginning main packet processing loop");
+
         // Main packet processing loop
         loop {
-            tracing::info!("Waiting for packet...");
-
             let packet = reader.read_some_packet(&mut crypto_state).await?;
             match packet.message_number()? {
                 packet::Disconnect::MESSAGE_NUMBER => {
@@ -193,6 +193,65 @@ impl Connection {
                     writer
                         .write_packet(&packet::UserAuthSuccess, &mut crypto_state)
                         .await?;
+                }
+                packet::ChannelOpen::MESSAGE_NUMBER => {
+                    let msg: packet::ChannelOpen = packet.try_unpack()?;
+                    tracing::info!("Received channel open request: {:#?}", msg);
+
+                    if msg.channel_type != "session" {
+                        tracing::warn!("Unsupported channel type: {}", msg.channel_type);
+
+                        let failure = packet::ChannelOpenFailure {
+                            recipient_channel: msg.sender_channel,
+                            reason_code: 3,
+                            description: format!("Unsupported channel type: {}", msg.channel_type),
+                            language_tag: "".to_string(),
+                        };
+
+                        writer.write_packet(&failure, &mut crypto_state).await?;
+                        continue;
+                    }
+
+                    // For now, we only support one channel
+                    let server_channel = 0;
+
+                    let open_confirmation = packet::ChannelOpenConfirmation {
+                        recipient_channel: msg.sender_channel,
+                        sender_channel: server_channel,
+                        initial_window_size: msg.initial_window_size, // Echo back the client's window size
+                        maximum_packet_size: msg.maximum_packet_size, // Echo back the client's max packet size
+                    };
+
+                    writer
+                        .write_packet(&open_confirmation, &mut crypto_state)
+                        .await?;
+                }
+                packet::ChannelRequest::MESSAGE_NUMBER => {
+                    let msg: packet::ChannelRequest = packet.try_unpack()?;
+                    tracing::info!("Received channel request: {:#?}", msg);
+
+                    match &msg.request_type {
+                        packet::ChannelRequestType::Env { .. } => {
+                            // TODO: Handle this
+                        }
+                        packet::ChannelRequestType::PtyReq { .. } => {
+                            // TODO: Handle this
+                        }
+                        packet::ChannelRequestType::Unknown { name } => {
+                            tracing::warn!("Received unknown channel request type: {}", name);
+                        }
+                    }
+
+                    if msg.want_reply {
+                        writer
+                            .write_packet(
+                                &packet::ChannelSuccess {
+                                    recipient_channel: msg.recipient_channel,
+                                },
+                                &mut crypto_state,
+                            )
+                            .await?;
+                    }
                 }
                 _ => {
                     tracing::info!(

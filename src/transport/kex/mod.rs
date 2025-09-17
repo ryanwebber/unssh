@@ -58,28 +58,35 @@ pub async fn perform_key_exchange(
     let negotiated_algorithms = negotiate(&server_kex, &client_kex)?;
     tracing::info!("Negotiated algorithms: {:#?}", negotiated_algorithms);
 
-    let host_key = {
-        let contents = std::fs::read_to_string(&config.host_key_path).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to read host key at path {}: {}",
-                config.host_key_path.display(),
-                e
-            )
-        })?;
-
-        let public_key = ssh_key::PublicKey::from_openssh(&contents)?;
-        let Some(key_data) = public_key.key_data().ed25519() else {
-            anyhow::bail!(
-                "Expected an ed25519 host key, got {}",
-                public_key.algorithm()
-            );
-        };
-
-        key_data.as_ref().to_vec()
-    };
-
     match negotiated_algorithms.kex_algorithm.as_str() {
         "diffie-hellman-group14-sha256" => {
+            if negotiated_algorithms.server_host_key_algorithm != "ssh-ed25519" {
+                anyhow::bail!(
+                    "Unsupported host key algorithm: {}",
+                    negotiated_algorithms.server_host_key_algorithm
+                );
+            }
+
+            let host_key = {
+                let contents = std::fs::read_to_string(&config.host_key_path).map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to read host key at path {}: {}",
+                        config.host_key_path.display(),
+                        e
+                    )
+                })?;
+
+                let public_key = ssh_key::PublicKey::from_openssh(&contents)?;
+                let Some(key_data) = public_key.key_data().ed25519() else {
+                    anyhow::bail!(
+                        "Expected an ed25519 host key, got {}",
+                        public_key.algorithm()
+                    );
+                };
+
+                key_data.as_ref().to_vec()
+            };
+
             diffie_hellman_group14_sha256::perform_key_exchange(
                 rng,
                 crypto,

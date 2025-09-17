@@ -71,6 +71,23 @@ impl PacketDecodable for ServiceRequest {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+pub struct ServiceAccept {
+    pub service_name: String,
+}
+
+impl Packet for ServiceAccept {
+    const MESSAGE_NUMBER: u8 = 6;
+    const MESSAGE_NAME: &'static str = "SSH_MSG_SERVICE_ACCEPT";
+}
+
+impl PacketEncodable for ServiceAccept {
+    fn write_into(&self, encoder: &mut PacketEncoder) -> anyhow::Result<()> {
+        encoder.write_string(&self.service_name)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
 pub struct KexInit {
     pub kex_algorithms: Vec<String>,
     pub server_host_key_algorithms: Vec<String>,

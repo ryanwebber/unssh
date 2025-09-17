@@ -137,7 +137,35 @@ impl Connection {
                 5 => {
                     let service_request: packet::ServiceRequest = packet.try_unpack()?;
                     tracing::info!("Received service request: {:#?}", service_request);
-                    anyhow::bail!("Service requests not supported yet");
+
+                    match service_request.service_name.as_str() {
+                        "ssh-userauth" => {
+                            let service_accept = packet::ServiceAccept {
+                                service_name: service_request.service_name.clone(),
+                            };
+                            writer
+                                .write_packet(&service_accept, &mut crypto_state)
+                                .await?;
+                        }
+                        _ => {
+                            tracing::warn!(
+                                "Unsupported service request: {}",
+                                service_request.service_name
+                            );
+
+                            let disconnect = packet::Disconnect {
+                                reason_code: 3,
+                                description: format!(
+                                    "Unsupported service: {}",
+                                    service_request.service_name
+                                ),
+                                language_tag: "".to_string(),
+                            };
+
+                            writer.write_packet(&disconnect, &mut crypto_state).await?;
+                            return Ok(());
+                        }
+                    }
                 }
                 _ => {
                     tracing::info!(
@@ -148,8 +176,8 @@ impl Connection {
                     // Write a disconnect and close the connection
                     let disconnect = packet::Disconnect {
                         reason_code: 2,
-                        description: "Protocol error: unhandled packet type".to_string(),
-                        language_tag: "".to_string(),
+                        description: format!("Unhandled packet type: {}", packet.message_number()?),
+                        language_tag: String::new(),
                     };
 
                     writer.write_packet(&disconnect, &mut crypto_state).await?;

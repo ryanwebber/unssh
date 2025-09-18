@@ -6,10 +6,13 @@ use sha2::{Digest, Sha256};
 use crate::transport::{
     buffer::{PacketDecodableExt, PacketEncodableExt},
     common::{ByteString, MultiPrecisionInteger, OwnedByteString},
-    crypto::{aes::Aes128Ctr, hmac::HmacSha256},
-    kex::KexContext,
+    crypto::{
+        self, DecryptionCipher, EncryptionCipher, MacSigner, MacVerification, aes::Aes128Ctr,
+        hmac::HmacSha256,
+    },
+    kex::{KexContext, KexResult},
     packet::{self},
-    stream::{CryptoState, EncryptedPacketReader, EncryptedPacketWriter},
+    stream::{EncryptedPacketReader, EncryptedPacketWriter},
 };
 
 /// RFC3526 group14 prime as a single hex string (no spaces/newlines)
@@ -85,18 +88,17 @@ fn derive_key(
 
 pub async fn perform_key_exchange(
     rng: &mut (impl rand::CryptoRng + rand::RngCore),
-    crypto: &mut CryptoState,
     kex_context: &KexContext,
     host_key: &[u8],
     reader: &mut EncryptedPacketReader<impl smol::io::AsyncRead + Clone + Unpin>,
     writer: &mut EncryptedPacketWriter<impl smol::io::AsyncWrite + Clone + Unpin>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<KexResult> {
     // 1. Create a signing key for the server host (Ed25519)
     let mut server_host_key = generate_signing_key(host_key)?;
     let server_verifying_key: VerifyingKey = server_host_key.verifying_key();
 
     // 2. Read KEXDH_INIT
-    let init: packet::KexDhInit = reader.read_packet(crypto).await?;
+    let init: packet::KexDhInit = reader.read_packet_as().await?;
     let client_pub =
         BigUint::from_bytes_be(&MultiPrecisionInteger::try_from_bytes(&init.e.bytes)?.bytes);
 
@@ -152,11 +154,11 @@ pub async fn perform_key_exchange(
         signature: OwnedByteString::new(&signature_blob),
     };
 
-    writer.write_packet(&reply, crypto).await?;
+    writer.write_packet(&reply).await?;
 
     // 8. Send and receive NEWKEYS
-    writer.write_packet(&packet::NewKeys, crypto).await?;
-    let _: packet::NewKeys = reader.read_packet(crypto).await?;
+    writer.write_packet(&packet::NewKeys).await?;
+    let _: packet::NewKeys = reader.read_packet_as().await?;
 
     // 9. Derive keys and set up encryption/MAC
     let session_id = h.clone();
@@ -171,33 +173,29 @@ pub async fn perform_key_exchange(
     let mac_c2s = derive_key(&k_mpint_with_len, &h, &session_id, b'E', 32)?;
     let mac_s2c = derive_key(&k_mpint_with_len, &h, &session_id, b'F', 32)?;
 
-    crypto.set_cipher({
-        let key_pairs = crate::transport::crypto::aes::KeyPair {
-            client_to_server: crate::transport::crypto::aes::Key {
-                key: &key_c2s,
-                iv: &iv_c2s,
-            },
-            server_to_client: crate::transport::crypto::aes::Key {
-                key: &key_s2c,
-                iv: &iv_s2c,
-            },
-        };
+    let encryption_cipher: Box<dyn EncryptionCipher> =
+        Box::new(Aes128Ctr::new(crypto::aes::Key {
+            key: &key_s2c,
+            iv: &iv_s2c,
+        })?);
 
-        Box::new(Aes128Ctr::new(key_pairs)?)
-    });
+    let decryption_cipher: Box<dyn DecryptionCipher> =
+        Box::new(Aes128Ctr::new(crypto::aes::Key {
+            key: &key_c2s,
+            iv: &iv_c2s,
+        })?);
 
-    crypto.set_mac({
-        let mac = crate::transport::crypto::hmac::DirectionalHmacSha256 {
-            client_to_server: HmacSha256::new(&mac_c2s),
-            server_to_client: HmacSha256::new(&mac_s2c),
-        };
-
-        Box::new(mac)
-    });
+    let mac_signer: Box<dyn MacSigner> = Box::new(HmacSha256::new(&mac_s2c));
+    let mac_verifier: Box<dyn MacVerification> = Box::new(HmacSha256::new(&mac_c2s));
 
     tracing::info!("Key exchange complete");
 
-    Ok(())
+    Ok(KexResult {
+        encryption_cipher,
+        decryption_cipher,
+        mac_signer,
+        mac_verifier,
+    })
 }
 
 fn generate_signing_key(host_key: &[u8]) -> anyhow::Result<ed25519_dalek::SigningKey> {

@@ -1,6 +1,7 @@
 use crate::{
     config::Config,
     transport::{
+        crypto::{DecryptionCipher, EncryptionCipher},
         packet::KexInit,
         stream::{EncryptedPacketReader, EncryptedPacketWriter},
     },
@@ -13,6 +14,13 @@ pub struct KexContext {
     pub server_version: String,
     pub client_kexinit: Vec<u8>,
     pub server_kexinit: Vec<u8>,
+}
+
+pub struct KexResult {
+    pub encryption_cipher: Box<dyn EncryptionCipher>,
+    pub decryption_cipher: Box<dyn DecryptionCipher>,
+    pub mac_signer: Box<dyn crate::transport::crypto::MacSigner>,
+    pub mac_verifier: Box<dyn crate::transport::crypto::MacVerification>,
 }
 
 #[derive(Debug)]
@@ -47,14 +55,13 @@ pub fn default_kex_init() -> KexInit {
 
 pub async fn perform_key_exchange(
     rng: &mut (impl rand::CryptoRng + rand::RngCore),
-    crypto: &mut crate::transport::stream::CryptoState,
     config: &Config,
     kex_context: &KexContext,
     server_kex: &KexInit,
     client_kex: &KexInit,
     reader: &mut EncryptedPacketReader<impl smol::io::AsyncRead + Clone + Unpin>,
     writer: &mut EncryptedPacketWriter<impl smol::io::AsyncWrite + Clone + Unpin>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<KexResult> {
     let negotiated_algorithms = negotiate(&server_kex, &client_kex)?;
     tracing::info!("Negotiated algorithms: {:#?}", negotiated_algorithms);
 
@@ -89,7 +96,6 @@ pub async fn perform_key_exchange(
 
             diffie_hellman_group14_sha256::perform_key_exchange(
                 rng,
-                crypto,
                 kex_context,
                 &host_key,
                 reader,

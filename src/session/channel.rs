@@ -54,10 +54,6 @@ impl Channel {
         Ok(())
     }
 
-    pub fn pty_reader_mut(&mut self) -> Option<&mut (dyn smol::io::AsyncRead + Send)> {
-        self.pty.as_mut().and_then(|pty| pty.reader_mut())
-    }
-
     pub fn pty_writer_mut(&mut self) -> Option<&mut (dyn smol::io::AsyncWrite + Send + Unpin)> {
         self.pty.as_mut().and_then(|pty| pty.writer_mut())
     }

@@ -8,11 +8,11 @@ use crate::{
     id::ShortCodeGenerator,
     session::{Session, channel, pty::PtySize},
     transport::{
-        buffer::Packet,
+        buffer::{Packet, PacketEncodable},
         common::OwnedByteString,
         kex,
         packet::{self},
-        stream::{CryptoState, EncryptedPacketReader, EncryptedPacketWriter},
+        stream::{EncryptedPacketReader, EncryptedPacketWriter, PacketPayload},
     },
 };
 
@@ -95,7 +95,6 @@ impl Connection {
 
         // TODO: This cannot be right, surely this is not secure?
         let mut rng = rand::rngs::OsRng::new()?;
-        let mut crypto_state = CryptoState::null();
 
         let mut reader = EncryptedPacketReader::new(stream.clone());
         let mut writer = EncryptedPacketWriter::new(stream.clone());
@@ -103,11 +102,9 @@ impl Connection {
         // Algorithm negotiation
         {
             let server_kexinit = kex::default_kex_init();
-            let server_kexinit_bytes = writer
-                .write_packet(&server_kexinit, &mut crypto_state)
-                .await?;
+            let server_kexinit_bytes = writer.write_packet(&server_kexinit).await?;
 
-            let client_response = reader.read_some_packet(&mut crypto_state).await?;
+            let client_response = reader.read_packet().await?;
             let client_kexinit: packet::KexInit = client_response.try_unpack()?;
             let client_kexinit_bytes = client_response.into_bytes();
 
@@ -118,9 +115,8 @@ impl Connection {
                 server_kexinit: server_kexinit_bytes,
             };
 
-            kex::perform_key_exchange(
+            let kex_result = kex::perform_key_exchange(
                 &mut rng,
-                &mut crypto_state,
                 self.config.as_ref(),
                 &kex_context,
                 &server_kexinit,
@@ -129,267 +125,335 @@ impl Connection {
                 &mut writer,
             )
             .await?;
+
+            reader.set_cipher(kex_result.decryption_cipher, kex_result.mac_verifier);
+            writer.set_cipher(kex_result.encryption_cipher, kex_result.mac_signer);
         }
 
         tracing::info!("Beginning main packet processing loop");
 
+        // Channel for events from the reader task to the main event loop
+        let (tx, rx) = smol::channel::unbounded::<Event>();
+
+        // Spawn a task to run the main event loop
+        let task_tx = tx.clone();
+        let client_task: smol::Task<anyhow::Result<()>> = smol::spawn(async move {
+            loop {
+                let packet = reader.read_packet().await?;
+                task_tx
+                    .send(Event::PacketReceived { payload: packet })
+                    .await?;
+            }
+        });
+
+        // Main event processing loop
+        let event_loop = ConnectionEventLoop { rx, tx, writer };
+
+        event_loop.run().await?;
+        client_task.await?;
+
+        Ok(())
+    }
+}
+
+struct ConnectionEventLoop {
+    rx: smol::channel::Receiver<Event>,
+    tx: smol::channel::Sender<Event>,
+    writer: EncryptedPacketWriter<smol::net::TcpStream>,
+}
+
+impl ConnectionEventLoop {
+    async fn send(
+        &mut self,
+        packet: &(impl Packet + PacketEncodable + std::fmt::Debug),
+    ) -> anyhow::Result<()> {
+        self.writer.write_packet(packet).await?;
+        Ok(())
+    }
+
+    async fn run(mut self) -> anyhow::Result<()> {
         let mut session = Session::new();
-
-        // Main packet processing loop
-        loop {
-            let packet = reader.read_some_packet(&mut crypto_state).await?;
-
-            match packet.message_number()? {
-                packet::Disconnect::MESSAGE_NUMBER => {
-                    let msg: packet::Disconnect = packet.try_unpack()?;
-                    tracing::info!("Received client disconnect packet: {:#?}", msg);
-                    return Ok(());
-                }
-                packet::Ignore::MESSAGE_NUMBER => {
-                    let msg: packet::Ignore = packet.try_unpack()?;
-                    tracing::info!("Received ignore packet: {:#?}", msg);
-                }
-                packet::Debug::MESSAGE_NUMBER => {
-                    let msg: packet::Debug = packet.try_unpack()?;
-                    tracing::info!("Received debug packet: {:#?}", msg);
-                }
-                packet::ServiceRequest::MESSAGE_NUMBER => {
-                    let msg: packet::ServiceRequest = packet.try_unpack()?;
-                    tracing::info!("Received service request: {:#?}", msg);
-
-                    match msg.service_name.as_str() {
-                        "ssh-userauth" => {
-                            let service_accept = packet::ServiceAccept {
-                                service_name: msg.service_name.clone(),
-                            };
-                            writer
-                                .write_packet(&service_accept, &mut crypto_state)
-                                .await?;
-                        }
-                        _ => {
-                            tracing::warn!("Unsupported service request: {}", msg.service_name);
-
-                            let disconnect = packet::Disconnect {
-                                reason_code: 3,
-                                description: format!("Unsupported service: {}", msg.service_name),
-                                language_tag: "".to_string(),
-                            };
-
-                            writer.write_packet(&disconnect, &mut crypto_state).await?;
+        while let Ok(event) = self.rx.recv().await {
+            match event {
+                Event::PacketReceived { payload } => {
+                    match payload.message_number()? {
+                        packet::Disconnect::MESSAGE_NUMBER => {
+                            let msg: packet::Disconnect = payload.try_unpack()?;
+                            tracing::info!("Received client disconnect packet: {:#?}", msg);
                             return Ok(());
                         }
-                    }
-                }
-                packet::UserAuthRequest::MESSAGE_NUMBER => {
-                    let msg: packet::UserAuthRequest = packet.try_unpack()?;
-                    tracing::info!("Received user auth request: {:#?}", msg);
+                        packet::Ignore::MESSAGE_NUMBER => {
+                            let msg: packet::Ignore = payload.try_unpack()?;
+                            tracing::info!("Received ignore packet: {:#?}", msg);
+                        }
+                        packet::Debug::MESSAGE_NUMBER => {
+                            let msg: packet::Debug = payload.try_unpack()?;
+                            tracing::info!("Received debug packet: {:#?}", msg);
+                        }
+                        packet::ServiceRequest::MESSAGE_NUMBER => {
+                            let msg: packet::ServiceRequest = payload.try_unpack()?;
+                            tracing::info!("Received service request: {:#?}", msg);
 
-                    writer
-                        .write_packet(
-                            &packet::UserAuthBanner {
+                            match msg.service_name.as_str() {
+                                "ssh-userauth" => {
+                                    self.send(&packet::ServiceAccept {
+                                        service_name: msg.service_name.clone(),
+                                    })
+                                    .await?;
+                                }
+                                _ => {
+                                    tracing::warn!(
+                                        "Unsupported service request: {}",
+                                        msg.service_name
+                                    );
+
+                                    self.send(&packet::Disconnect {
+                                        reason_code: 3,
+                                        description: format!(
+                                            "Unsupported service: {}",
+                                            msg.service_name
+                                        ),
+                                        language_tag: "".to_string(),
+                                    })
+                                    .await?;
+
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        packet::UserAuthRequest::MESSAGE_NUMBER => {
+                            let msg: packet::UserAuthRequest = payload.try_unpack()?;
+                            tracing::info!("Received user auth request: {:#?}", msg);
+
+                            // User auth banner
+                            self.send(&packet::UserAuthBanner {
                                 message: "Welcome to the unssh server!\n".to_string(),
                                 language_tag: "".to_string(),
-                            },
-                            &mut crypto_state,
-                        )
-                        .await?;
+                            })
+                            .await?;
 
-                    // For now, we accept zero authentication and just auth everyone
-                    writer
-                        .write_packet(&packet::UserAuthSuccess, &mut crypto_state)
-                        .await?;
-                }
-                packet::ChannelOpen::MESSAGE_NUMBER => {
-                    let msg: packet::ChannelOpen = packet.try_unpack()?;
-                    tracing::info!("Received channel open request: {:#?}", msg);
+                            // For now, we accept zero authentication and just auth everyone
+                            self.send(&packet::UserAuthSuccess).await?;
+                        }
+                        packet::ChannelOpen::MESSAGE_NUMBER => {
+                            let msg: packet::ChannelOpen = payload.try_unpack()?;
+                            tracing::info!("Received channel open request: {:#?}", msg);
 
-                    if msg.channel_type != "session" {
-                        tracing::warn!("Unsupported channel type: {}", msg.channel_type);
+                            if msg.channel_type != "session" {
+                                tracing::warn!("Unsupported channel type: {}", msg.channel_type);
 
-                        let failure = packet::ChannelOpenFailure {
-                            recipient_channel: msg.sender_channel,
-                            reason_code: 3,
-                            description: format!("Unsupported channel type: {}", msg.channel_type),
-                            language_tag: "".to_string(),
-                        };
+                                self.send(&packet::ChannelOpenFailure {
+                                    recipient_channel: msg.sender_channel,
+                                    reason_code: 3,
+                                    description: format!(
+                                        "Unsupported channel type: {}",
+                                        msg.channel_type
+                                    ),
+                                    language_tag: "".to_string(),
+                                })
+                                .await?;
 
-                        writer.write_packet(&failure, &mut crypto_state).await?;
-                        continue;
+                                continue;
+                            }
+
+                            // Create a new channel in the session
+                            let (channel, local_id) =
+                                session.open_channel(channel::RemoteID(msg.sender_channel));
+
+                            self.send(&packet::ChannelOpenConfirmation {
+                                recipient_channel: channel.remote_id().as_u32(),
+                                sender_channel: local_id.as_u32(),
+                                initial_window_size: msg.initial_window_size, // Echo back the client's window size
+                                maximum_packet_size: msg.maximum_packet_size, // Echo back the client's max packet size
+                            })
+                            .await?;
+                        }
+                        packet::ChannelRequest::MESSAGE_NUMBER => {
+                            let msg: packet::ChannelRequest = payload.try_unpack()?;
+                            tracing::info!("Received channel request: {:#?}", msg);
+
+                            let channel = match session
+                                .channel_mut(&&channel::LocalID(msg.recipient_channel))
+                            {
+                                Some(chan) => chan,
+                                None => {
+                                    // Disconnect the client for requesting on an unknown channel
+                                    self.send(&packet::Disconnect {
+                                        reason_code: 2,
+                                        description: format!(
+                                            "Channel request on unknown channel: {}",
+                                            msg.recipient_channel
+                                        ),
+                                        language_tag: String::new(),
+                                    })
+                                    .await?;
+
+                                    anyhow::bail!(
+                                        "Channel request on unknown channel: {}",
+                                        msg.recipient_channel
+                                    );
+                                }
+                            };
+
+                            let response: anyhow::Result<()> = match &msg.request_type {
+                                packet::ChannelRequestType::Env { .. } => {
+                                    // TODO: Support environment variables
+                                    Ok(())
+                                }
+                                packet::ChannelRequestType::Exec { .. } => {
+                                    // TODO: Support exec requests
+                                    Err(anyhow::anyhow!("Exec requests are not supported yet"))
+                                }
+                                packet::ChannelRequestType::PtyReq {
+                                    columns,
+                                    rows,
+                                    width_px,
+                                    height_px,
+                                    ..
+                                } => channel.open_pty(PtySize {
+                                    rows: *rows as u16,
+                                    cols: *columns as u16,
+                                    pixel_width: *width_px as u16,
+                                    pixel_height: *height_px as u16,
+                                }),
+                                packet::ChannelRequestType::Shell => channel.spawn_shell(),
+                                packet::ChannelRequestType::Subsystem { .. } => {
+                                    // TODO: Support subsystems like SFTP
+                                    Err(anyhow::anyhow!("Subsystems are not implemented yet"))
+                                }
+                                packet::ChannelRequestType::Unknown { name } => {
+                                    Err(anyhow::anyhow!("Unknown channel request type: {}", name))
+                                }
+                                &packet::ChannelRequestType::X11Req { .. } => {
+                                    Err(anyhow::anyhow!("X11 forwarding is not supported"))
+                                }
+                            };
+
+                            if let Err(ref e) = response {
+                                tracing::warn!("Channel request failed: {}", e);
+                            }
+
+                            if msg.want_reply {
+                                match response {
+                                    Ok(..) => {
+                                        self.send(&packet::ChannelSuccess {
+                                            recipient_channel: channel.remote_id().as_u32(),
+                                        })
+                                        .await?;
+                                    }
+                                    Err(..) => {
+                                        self.send(&packet::ChannelFailure {
+                                            recipient_channel: channel.remote_id().as_u32(),
+                                        })
+                                        .await?;
+                                    }
+                                }
+                            }
+                        }
+                        packet::ChannelData::MESSAGE_NUMBER => {
+                            let msg: packet::ChannelData = payload.try_unpack()?;
+                            tracing::info!("Received channel data: {:#?}", msg);
+
+                            let channel = match session
+                                .channel_mut(&&channel::LocalID(msg.recipient_channel))
+                            {
+                                Some(chan) => chan,
+                                None => {
+                                    // Disconnect the client for sending data on an unknown channel
+                                    self.send(&packet::Disconnect {
+                                        reason_code: 2,
+                                        description: format!(
+                                            "Channel data on unknown channel: {}",
+                                            msg.recipient_channel
+                                        ),
+                                        language_tag: String::new(),
+                                    })
+                                    .await?;
+
+                                    anyhow::bail!(
+                                        "Channel data on unknown channel: {}",
+                                        msg.recipient_channel
+                                    );
+                                }
+                            };
+
+                            // Try to write the data to the channel's PTY
+                            if let Some(pty_writer) = channel.pty_writer_mut() {
+                                smol::pin!(pty_writer);
+                                pty_writer.write_all(&msg.data.bytes).await?;
+                            } else {
+                                tracing::warn!(
+                                    "Received data for channel {} which has no PTY",
+                                    msg.recipient_channel
+                                );
+
+                                Err(anyhow::anyhow!(
+                                    "Channel {} has no PTY to write data to",
+                                    msg.recipient_channel
+                                ))?;
+                            }
+                        }
+                        _ => {
+                            tracing::info!(
+                                "Received unhandled packet type: {}",
+                                payload.message_number()?
+                            );
+
+                            // Write a disconnect and close the connection
+                            self.send(&packet::Disconnect {
+                                reason_code: 2,
+                                description: format!(
+                                    "Unhandled packet type: {}",
+                                    payload.message_number()?
+                                ),
+                                language_tag: String::new(),
+                            })
+                            .await?;
+
+                            anyhow::bail!("Unhandled packet type: {}", payload.message_number()?);
+                        }
                     }
+                }
+                Event::PtyOutput { data, channel, .. } => {
+                    let channel = match session.channel_mut(&&channel::LocalID(channel.as_u32())) {
+                        Some(chan) => chan,
+                        None => {
+                            tracing::warn!(
+                                "Received PTY output for unknown channel: {}",
+                                channel.as_u32()
+                            );
 
-                    // Create a new channel in the session
-                    let (channel, local_id) =
-                        session.open_channel(channel::RemoteID(msg.sender_channel));
+                            continue;
+                        }
+                    };
 
-                    let open_confirmation = packet::ChannelOpenConfirmation {
+                    self.send(&packet::ChannelData {
                         recipient_channel: channel.remote_id().as_u32(),
-                        sender_channel: local_id.as_u32(),
-                        initial_window_size: msg.initial_window_size, // Echo back the client's window size
-                        maximum_packet_size: msg.maximum_packet_size, // Echo back the client's max packet size
-                    };
-
-                    writer
-                        .write_packet(&open_confirmation, &mut crypto_state)
-                        .await?;
-                }
-                packet::ChannelRequest::MESSAGE_NUMBER => {
-                    let msg: packet::ChannelRequest = packet.try_unpack()?;
-                    tracing::info!("Received channel request: {:#?}", msg);
-
-                    let channel =
-                        match session.channel_mut(&&channel::LocalID(msg.recipient_channel)) {
-                            Some(chan) => chan,
-                            None => {
-                                // Disconnect the client for requesting on an unknown channel
-                                writer
-                                    .write_packet(
-                                        &packet::Disconnect {
-                                            reason_code: 2,
-                                            description: format!(
-                                                "Channel request on unknown channel: {}",
-                                                msg.recipient_channel
-                                            ),
-                                            language_tag: String::new(),
-                                        },
-                                        &mut crypto_state,
-                                    )
-                                    .await?;
-
-                                anyhow::bail!(
-                                    "Channel request on unknown channel: {}",
-                                    msg.recipient_channel
-                                );
-                            }
-                        };
-
-                    let response: anyhow::Result<()> = match &msg.request_type {
-                        packet::ChannelRequestType::Env { .. } => {
-                            // TODO: Support environment variables
-                            Ok(())
-                        }
-                        packet::ChannelRequestType::Exec { .. } => {
-                            // TODO: Support exec requests
-                            Err(anyhow::anyhow!("Exec requests are not supported yet"))
-                        }
-                        packet::ChannelRequestType::PtyReq {
-                            term,
-                            columns,
-                            rows,
-                            width_px,
-                            height_px,
-                            ..
-                        } => channel.open_pty(PtySize {
-                            rows: *rows as u16,
-                            cols: *columns as u16,
-                            pixel_width: *width_px as u16,
-                            pixel_height: *height_px as u16,
-                        }),
-                        packet::ChannelRequestType::Shell => channel.spawn_shell(),
-                        packet::ChannelRequestType::Subsystem { .. } => {
-                            // TODO: Support subsystems like SFTP
-                            Err(anyhow::anyhow!("Subsystems are not implemented yet"))
-                        }
-                        packet::ChannelRequestType::Unknown { name } => {
-                            Err(anyhow::anyhow!("Unknown channel request type: {}", name))
-                        }
-                        &packet::ChannelRequestType::X11Req { .. } => {
-                            Err(anyhow::anyhow!("X11 forwarding is not supported"))
-                        }
-                    };
-
-                    if let Err(ref e) = response {
-                        tracing::warn!("Channel request failed: {}", e);
-                    }
-
-                    if msg.want_reply {
-                        match response {
-                            Ok(..) => {
-                                writer
-                                    .write_packet(
-                                        &packet::ChannelSuccess {
-                                            recipient_channel: channel.remote_id().as_u32(),
-                                        },
-                                        &mut crypto_state,
-                                    )
-                                    .await?;
-                            }
-                            Err(..) => {
-                                writer
-                                    .write_packet(
-                                        &packet::ChannelFailure {
-                                            recipient_channel: channel.remote_id().as_u32(),
-                                        },
-                                        &mut crypto_state,
-                                    )
-                                    .await?;
-                            }
-                        }
-                    }
-                }
-                packet::ChannelData::MESSAGE_NUMBER => {
-                    let msg: packet::ChannelData = packet.try_unpack()?;
-                    tracing::info!("Received channel data: {:#?}", msg);
-
-                    let channel =
-                        match session.channel_mut(&&channel::LocalID(msg.recipient_channel)) {
-                            Some(chan) => chan,
-                            None => {
-                                // Disconnect the client for sending data on an unknown channel
-                                writer
-                                    .write_packet(
-                                        &packet::Disconnect {
-                                            reason_code: 2,
-                                            description: format!(
-                                                "Channel data on unknown channel: {}",
-                                                msg.recipient_channel
-                                            ),
-                                            language_tag: String::new(),
-                                        },
-                                        &mut crypto_state,
-                                    )
-                                    .await?;
-
-                                anyhow::bail!(
-                                    "Channel data on unknown channel: {}",
-                                    msg.recipient_channel
-                                );
-                            }
-                        };
-
-                    // Try to write the data to the channel's PTY
-                    if let Some(pty_writer) = channel.pty_writer_mut() {
-                        smol::pin!(pty_writer);
-                        pty_writer.write_all(&msg.data.bytes).await?;
-                    } else {
-                        tracing::warn!(
-                            "Received data for channel {} which has no PTY",
-                            msg.recipient_channel
-                        );
-
-                        Err(anyhow::anyhow!(
-                            "Channel {} has no PTY to write data to",
-                            msg.recipient_channel
-                        ))?;
-                    }
-                }
-                _ => {
-                    tracing::info!(
-                        "Received unhandled packet type: {}",
-                        packet.message_number()?
-                    );
-
-                    // Write a disconnect and close the connection
-                    let disconnect = packet::Disconnect {
-                        reason_code: 2,
-                        description: format!("Unhandled packet type: {}", packet.message_number()?),
-                        language_tag: String::new(),
-                    };
-
-                    writer.write_packet(&disconnect, &mut crypto_state).await?;
-
-                    anyhow::bail!("Unhandled packet type: {}", packet.message_number()?);
+                        data: OwnedByteString { bytes: data },
+                    })
+                    .await?;
                 }
             }
         }
+
+        Ok(())
     }
+}
+
+#[derive(Clone)]
+enum Event {
+    PacketReceived {
+        payload: PacketPayload,
+    },
+    PtyOutput {
+        data: Vec<u8>,
+        channel: channel::RemoteID,
+        stream: OutputStream,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutputStream {
+    Stdout,
+    Stderr,
 }

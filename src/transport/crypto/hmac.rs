@@ -1,4 +1,4 @@
-use crate::transport::crypto::Mac;
+use crate::transport::crypto::{MacSigner, MacVerification};
 
 pub struct HmacSha256 {
     key: Vec<u8>,
@@ -11,7 +11,7 @@ impl HmacSha256 {
 }
 
 impl HmacSha256 {
-    fn compute(&mut self, seq_num: u32, packet: &[u8]) -> anyhow::Result<Vec<u8>> {
+    fn compute_impl(&mut self, seq_num: u32, packet: &[u8]) -> anyhow::Result<Vec<u8>> {
         use hmac::{Hmac, Mac as HmacTrait};
         use sha2::Sha256;
 
@@ -25,28 +25,25 @@ impl HmacSha256 {
     }
 }
 
-pub struct DirectionalHmacSha256 {
-    pub client_to_server: HmacSha256,
-    pub server_to_client: HmacSha256,
-}
-
-impl Mac for DirectionalHmacSha256 {
+impl MacVerification for HmacSha256 {
     fn len(&self) -> usize {
         32
     }
 
-    fn name(&self) -> &'static str {
-        "hmac-sha256"
-    }
-
-    fn compute(&mut self, seq_num: u32, packet: &[u8]) -> anyhow::Result<Vec<u8>> {
-        self.server_to_client.compute(seq_num, packet)
-    }
-
     fn verify(&mut self, seq_num: u32, packet: &[u8], mac: &[u8]) -> bool {
-        match self.client_to_server.compute(seq_num, packet) {
+        match self.compute_impl(seq_num, packet) {
             Ok(computed_mac) => computed_mac.as_slice() == mac,
             Err(_) => false,
         }
+    }
+}
+
+impl MacSigner for HmacSha256 {
+    fn len(&self) -> usize {
+        32
+    }
+
+    fn compute(&mut self, seq_num: u32, packet: &[u8]) -> anyhow::Result<Vec<u8>> {
+        self.compute_impl(seq_num, packet)
     }
 }

@@ -4,41 +4,14 @@ use smol::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 
 use crate::transport::{
     buffer::{Packet, PacketDecodable, PacketDecoder, PacketEncodable, PacketEncoder},
-    crypto::{Cipher, Mac},
+    crypto::{self, DecryptionCipher, EncryptionCipher, MacSigner, MacVerification},
 };
-
-pub struct CryptoState {
-    cipher: Box<dyn Cipher>,
-    mac: Box<dyn Mac>,
-    // SSH maintains independent sequence numbers per direction
-    seq_in: u32,
-    seq_out: u32,
-}
-
-impl CryptoState {
-    pub fn null() -> Self {
-        let (cipher, mac) = crate::transport::crypto::null();
-        Self {
-            cipher,
-            mac,
-            seq_in: 0,
-            seq_out: 0,
-        }
-    }
-
-    pub fn set_cipher(&mut self, cipher: Box<dyn Cipher>) {
-        tracing::info!("Updating cipher to {}", cipher.name());
-        self.cipher = cipher;
-    }
-
-    pub fn set_mac(&mut self, mac: Box<dyn Mac>) {
-        tracing::info!("Updating MAC to {}", mac.name());
-        self.mac = mac;
-    }
-}
 
 pub struct EncryptedPacketReader<R> {
     inner: BufReader<R>,
+    seqence_number: u32,
+    cipher: Box<dyn DecryptionCipher>,
+    mac: Box<dyn MacVerification>,
 }
 
 impl<R> EncryptedPacketReader<R>
@@ -48,18 +21,23 @@ where
     pub fn new(reader: R) -> Self {
         EncryptedPacketReader {
             inner: BufReader::new(reader),
+            seqence_number: 0,
+            cipher: crypto::null::Null::new(),
+            mac: crypto::null::Null::new(),
         }
     }
 
-    pub async fn read_some_packet(
-        &mut self,
-        crypto: &mut CryptoState,
-    ) -> anyhow::Result<PacketPayload> {
+    pub fn set_cipher(&mut self, cipher: Box<dyn DecryptionCipher>, mac: Box<dyn MacVerification>) {
+        self.cipher = cipher;
+        self.mac = mac;
+    }
+
+    pub async fn read_packet(&mut self) -> anyhow::Result<PacketPayload> {
         // CTR mode: read exactly 4-byte header and decrypt it to get packet_length
         let mut header = [0u8; 4];
         self.inner.read_exact(&mut header).await?;
         let header_cipher = header;
-        crypto.cipher.decrypt(&mut header);
+        self.cipher.decrypt(&mut header);
         let header_plain = header;
         let packet_length = u32::from_be_bytes(header_plain) as usize;
 
@@ -83,17 +61,17 @@ where
         // Read body and decrypt streaming
         let mut body = vec![0u8; packet_length];
         self.inner.read_exact(&mut body).await?;
-        crypto.cipher.decrypt(&mut body);
+        self.cipher.decrypt(&mut body);
 
         let mut full_plain = header.to_vec();
         full_plain.extend_from_slice(&body);
 
         // Read and verify MAC if needed
-        let mac_len = crypto.mac.len();
+        let mac_len = self.mac.len();
         if mac_len > 0 {
             let mut mac_buf = vec![0u8; mac_len];
             self.inner.read_exact(&mut mac_buf).await?;
-            if !crypto.mac.verify(crypto.seq_in, &full_plain, &mac_buf) {
+            if !self.mac.verify(self.seqence_number, &full_plain, &mac_buf) {
                 anyhow::bail!("MAC verification failed");
             }
         }
@@ -115,22 +93,22 @@ where
             payload.message_number()?
         );
 
-        crypto.seq_in = crypto.seq_in.wrapping_add(1);
+        self.seqence_number = self.seqence_number.wrapping_add(1);
 
         Ok(payload)
     }
 
-    pub async fn read_packet<T: Packet + PacketDecodable + Debug>(
+    pub async fn read_packet_as<T: Packet + PacketDecodable + Debug>(
         &mut self,
-        crypto: &mut CryptoState,
     ) -> anyhow::Result<T> {
-        let payload = self.read_some_packet(crypto).await?;
+        let payload = self.read_packet().await?;
         let packet = payload.try_unpack::<T>()?;
         tracing::trace!("Read and decoded packet: {:#?}", packet);
         Ok(packet)
     }
 }
 
+#[derive(Clone)]
 pub struct PacketPayload {
     payload_bytes: Vec<u8>,
 }
@@ -162,6 +140,9 @@ impl PacketPayload {
 
 pub struct EncryptedPacketWriter<W> {
     inner: BufWriter<W>,
+    sequence_number: u32,
+    cipher: Box<dyn EncryptionCipher>,
+    mac: Box<dyn MacSigner>,
 }
 
 impl<W> EncryptedPacketWriter<W>
@@ -171,13 +152,20 @@ where
     pub fn new(inner: W) -> Self {
         EncryptedPacketWriter {
             inner: BufWriter::new(inner),
+            sequence_number: 0,
+            cipher: crypto::null::Null::new(),
+            mac: crypto::null::Null::new(),
         }
+    }
+
+    pub fn set_cipher(&mut self, cipher: Box<dyn EncryptionCipher>, mac: Box<dyn MacSigner>) {
+        self.cipher = cipher;
+        self.mac = mac;
     }
 
     pub async fn write_packet<T: Packet + PacketEncodable + Debug>(
         &mut self,
         packet: &T,
-        crypto: &mut CryptoState,
     ) -> anyhow::Result<Vec<u8>> {
         tracing::trace!("Writing packet: {:#?}", packet);
 
@@ -194,15 +182,15 @@ where
             let mut data: Vec<u8> = vec![];
             let mut packet_writer: PacketWriter<&mut Vec<u8>> = PacketWriter::new(&mut data);
 
-            packet_writer.write(&payload_data, crypto.cipher.block_size())?;
+            packet_writer.write(&payload_data, self.cipher.block_size())?;
             data
         };
 
         // 2. Compute MAC over plaintext (RFC 4253 §6)
-        let mac = crypto.mac.compute(crypto.seq_out, &packet_data)?;
+        let mac = self.mac.compute(self.sequence_number, &packet_data)?;
 
         // 3. Encrypt in place (CTR)
-        crypto.cipher.encrypt(&mut packet_data);
+        self.cipher.encrypt(&mut packet_data);
 
         // 4. Write cipher text + mac
         self.inner.write_all(&packet_data).await?;
@@ -211,7 +199,7 @@ where
         }
 
         // 5. Increment outbound sequence number
-        crypto.seq_out = crypto.seq_out.wrapping_add(1);
+        self.sequence_number = self.sequence_number.wrapping_add(1);
 
         // 6. Flush
         self.inner.flush().await?;

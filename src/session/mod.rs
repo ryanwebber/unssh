@@ -31,12 +31,4 @@ impl Session {
     pub fn channel_mut(&mut self, local_id: &LocalID) -> Option<&mut Channel> {
         self.channels.get_mut(local_id)
     }
-
-    pub fn iter_readers_mut(
-        &mut self,
-    ) -> impl Iterator<Item = &mut (dyn smol::io::AsyncRead + Send)> {
-        self.channels
-            .values_mut()
-            .filter_map(|ch| ch.pty_reader_mut())
-    }
 }

@@ -1,0 +1,64 @@
+use crate::session::pty::{self, Pty, PtySize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LocalID(pub u32);
+
+impl LocalID {
+    pub fn as_u32(&self) -> u32 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RemoteID(pub u32);
+
+impl RemoteID {
+    pub fn as_u32(&self) -> u32 {
+        self.0
+    }
+}
+
+pub struct Channel {
+    id: RemoteID,
+    pty: Option<Pty>,
+}
+
+impl Channel {
+    pub fn new(id: RemoteID) -> Self {
+        Self { id, pty: None }
+    }
+
+    pub fn remote_id(&self) -> RemoteID {
+        self.id
+    }
+
+    pub fn open_pty(&mut self, size: PtySize) -> anyhow::Result<()> {
+        if self.pty.is_none() {
+            let pty = Pty::try_open(size)?;
+            self.pty = Some(pty);
+            Ok(())
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn spawn_shell(&mut self) -> anyhow::Result<()> {
+        let Some(ref mut pty) = self.pty else {
+            anyhow::bail!("PTY not opened");
+        };
+
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let cmd = pty::CommandBuilder::new(&shell);
+        pty.spawn_command(cmd)?;
+
+        Ok(())
+    }
+
+    pub fn pty_reader_mut(&mut self) -> Option<&mut (dyn smol::io::AsyncRead + Send)> {
+        self.pty.as_mut().and_then(|pty| pty.reader_mut())
+    }
+
+    pub fn pty_writer_mut(&mut self) -> Option<&mut (dyn smol::io::AsyncWrite + Send + Unpin)> {
+        self.pty.as_mut().and_then(|pty| pty.writer_mut())
+    }
+}

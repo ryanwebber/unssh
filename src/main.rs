@@ -6,6 +6,7 @@ mod config;
 mod id;
 mod logging;
 mod server;
+mod session;
 mod transport;
 
 /// A dodgy SSH server that you shouldn't use

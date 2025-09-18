@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 
 use crate::transport::{
     buffer::{PacketDecodableExt, PacketEncodableExt},
-    common::{ByteString, MultiPrecisionInteger},
+    common::{ByteString, MultiPrecisionInteger, OwnedByteString},
     crypto::{aes::Aes128Ctr, hmac::HmacSha256},
     kex::KexContext,
     packet::{self},
@@ -97,7 +97,8 @@ pub async fn perform_key_exchange(
 
     // 2. Read KEXDH_INIT
     let init: packet::KexDhInit = reader.read_packet(crypto).await?;
-    let client_pub = BigUint::from_bytes_be(&MultiPrecisionInteger::try_from_bytes(&init.e)?.bytes);
+    let client_pub =
+        BigUint::from_bytes_be(&MultiPrecisionInteger::try_from_bytes(&init.e.bytes)?.bytes);
 
     // 3. Generate server DH keypair
     let p = BigUint::from_str_radix(P, 16)?;
@@ -146,9 +147,9 @@ pub async fn perform_key_exchange(
 
     // 7. Send KEXDH_REPLY
     let reply = packet::KexDhReply {
-        host_key: host_key_blob,
-        f: f.to_bytes_be(),
-        signature: signature_blob,
+        host_key: OwnedByteString::new(&host_key_blob),
+        f: OwnedByteString::new(&f.to_bytes_be()),
+        signature: OwnedByteString::new(&signature_blob),
     };
 
     writer.write_packet(&reply, crypto).await?;

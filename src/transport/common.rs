@@ -97,13 +97,30 @@ impl<'a> PacketEncodable for ByteString<'a> {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
 pub struct OwnedByteString {
     pub bytes: Vec<u8>,
 }
 
 impl OwnedByteString {
+    pub fn new(bytes: &[u8]) -> Self {
+        Self {
+            bytes: bytes.to_vec(),
+        }
+    }
+
+    pub fn borrowed(&self) -> ByteString<'_> {
+        ByteString { bytes: &self.bytes }
+    }
+
     pub fn into_inner(self) -> Vec<u8> {
         self.bytes
+    }
+}
+
+impl std::fmt::Debug for OwnedByteString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Bytes(...<{} bytes>)", self.bytes.len())
     }
 }
 

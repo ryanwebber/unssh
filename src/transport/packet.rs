@@ -2,7 +2,7 @@ use num_enum::TryFromPrimitive;
 
 use crate::transport::{
     buffer::{Packet, PacketDecodable, PacketDecoder, PacketEncodable, PacketEncoder},
-    common::{ByteString, MultiPrecisionInteger, NameList, OwnedByteString, OwnedNameList},
+    common::{MultiPrecisionInteger, NameList, OwnedByteString, OwnedNameList},
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -202,7 +202,7 @@ impl PacketDecodable for KexInit {
 #[derive(Debug)]
 pub struct KexDhInit {
     /// Client public value
-    pub e: Vec<u8>,
+    pub e: OwnedByteString,
 }
 
 impl Packet for KexDhInit {
@@ -213,7 +213,9 @@ impl Packet for KexDhInit {
 impl PacketDecodable for KexDhInit {
     fn read_from<'a>(decoder: &mut PacketDecoder<'a>) -> anyhow::Result<Self> {
         Ok(Self {
-            e: decoder.read_remaining().to_vec(),
+            e: OwnedByteString {
+                bytes: decoder.read_remaining().to_vec(),
+            },
         })
     }
 }
@@ -221,11 +223,11 @@ impl PacketDecodable for KexDhInit {
 #[derive(Debug)]
 pub struct KexDhReply {
     /// Encoded server host key
-    pub host_key: Vec<u8>,
+    pub host_key: OwnedByteString,
     /// Server public value
-    pub f: Vec<u8>,
+    pub f: OwnedByteString,
     /// Signature over exchange hash H
-    pub signature: Vec<u8>,
+    pub signature: OwnedByteString,
 }
 
 impl Packet for KexDhReply {
@@ -235,9 +237,9 @@ impl Packet for KexDhReply {
 
 impl PacketEncodable for KexDhReply {
     fn write_into(&self, encoder: &mut PacketEncoder) -> anyhow::Result<()> {
-        encoder.write(&ByteString::new(&self.host_key))?;
-        encoder.write(&MultiPrecisionInteger::new(self.f.clone()))?;
-        encoder.write(&ByteString::new(&self.signature))?;
+        encoder.write(&self.host_key.borrowed())?;
+        encoder.write(&MultiPrecisionInteger::new(self.f.bytes.to_vec()))?;
+        encoder.write(&self.signature.borrowed())?;
         Ok(())
     }
 }
@@ -388,18 +390,31 @@ impl PacketEncodable for ChannelOpenFailure {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub struct ChannelSuccess {
+pub struct ChannelData {
     pub recipient_channel: u32,
+    pub data: OwnedByteString,
 }
 
-impl Packet for ChannelSuccess {
-    const MESSAGE_NUMBER: u8 = 99;
-    const MESSAGE_NAME: &'static str = "SSH_MSG_CHANNEL_SUCCESS";
+impl Packet for ChannelData {
+    const MESSAGE_NUMBER: u8 = 94;
+    const MESSAGE_NAME: &'static str = "SSH_MSG_CHANNEL_DATA";
 }
 
-impl PacketEncodable for ChannelSuccess {
+impl PacketDecodable for ChannelData {
+    fn read_from<'a>(decoder: &mut PacketDecoder<'a>) -> anyhow::Result<Self> {
+        let recipient_channel = decoder.read_u32()?;
+        let data = decoder.read::<OwnedByteString>()?;
+        Ok(Self {
+            recipient_channel,
+            data,
+        })
+    }
+}
+
+impl PacketEncodable for ChannelData {
     fn write_into(&self, encoder: &mut PacketEncoder) -> anyhow::Result<()> {
         encoder.write_u32(self.recipient_channel);
+        encoder.write(&self.data.borrowed())?;
         Ok(())
     }
 }
@@ -417,6 +432,9 @@ pub enum ChannelRequestType {
         name: String,
         value: String,
     },
+    Exec {
+        command: String,
+    },
     PtyReq {
         term: String,
         columns: u32,
@@ -425,8 +443,18 @@ pub enum ChannelRequestType {
         height_px: u32,
         modes: Vec<EncodedTerminalMode>,
     },
+    Shell,
+    Subsystem {
+        name: String,
+    },
     Unknown {
         name: String,
+    },
+    X11Req {
+        single_connection: bool,
+        auth_protocol: String,
+        auth_cookie: Vec<u8>,
+        screen_number: u32,
     },
 }
 
@@ -439,7 +467,6 @@ pub struct EncodedTerminalMode {
 #[repr(u8)]
 #[derive(TryFromPrimitive, Debug, PartialEq, Eq)]
 pub enum EncodedTerminalOpcode {
-    TtyOpEnd = 0,
     VIntr = 1,
     VQuit = 2,
     VErase = 3,
@@ -515,6 +542,10 @@ impl PacketDecodable for ChannelRequest {
                 let value = decoder.read_string()?;
                 ChannelRequestType::Env { name, value }
             }
+            "exec" => {
+                let command = decoder.read_string()?;
+                ChannelRequestType::Exec { command }
+            }
             "pty-req" => {
                 let term = decoder.read_string()?;
                 let columns = decoder.read_u32()?;
@@ -525,12 +556,13 @@ impl PacketDecodable for ChannelRequest {
                     let bytestream = decoder.read::<OwnedByteString>()?.into_inner();
                     let mut modes = Vec::new();
                     for bytes in bytestream.chunks(5) {
-                        let opcode = EncodedTerminalOpcode::try_from(bytes[0])
-                            .unwrap_or(EncodedTerminalOpcode::Unknown);
-
-                        if opcode == EncodedTerminalOpcode::TtyOpEnd {
+                        // Opcode 0 indicates end of modes
+                        if bytes[0] == 0 {
                             break;
                         }
+
+                        let opcode = EncodedTerminalOpcode::try_from(bytes[0])
+                            .unwrap_or(EncodedTerminalOpcode::Unknown);
 
                         let value = PacketDecoder::new(&bytes[1..5]).read_u32()?;
                         modes.push(EncodedTerminalMode { opcode, value });
@@ -547,6 +579,23 @@ impl PacketDecodable for ChannelRequest {
                     modes,
                 }
             }
+            "shell" => ChannelRequestType::Shell,
+            "subsystem" => {
+                let name = decoder.read_string()?;
+                ChannelRequestType::Subsystem { name }
+            }
+            "x11-req" => {
+                let single_connection = decoder.read_u8()? != 0;
+                let auth_protocol = decoder.read_string()?;
+                let auth_cookie = decoder.read::<OwnedByteString>()?.into_inner();
+                let screen_number = decoder.read_u32()?;
+                ChannelRequestType::X11Req {
+                    single_connection,
+                    auth_protocol,
+                    auth_cookie,
+                    screen_number,
+                }
+            }
             _ => ChannelRequestType::Unknown {
                 name: request_type_str,
             },
@@ -557,6 +606,40 @@ impl PacketDecodable for ChannelRequest {
             request_type,
             want_reply,
         })
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct ChannelSuccess {
+    pub recipient_channel: u32,
+}
+
+impl Packet for ChannelSuccess {
+    const MESSAGE_NUMBER: u8 = 99;
+    const MESSAGE_NAME: &'static str = "SSH_MSG_CHANNEL_SUCCESS";
+}
+
+impl PacketEncodable for ChannelSuccess {
+    fn write_into(&self, encoder: &mut PacketEncoder) -> anyhow::Result<()> {
+        encoder.write_u32(self.recipient_channel);
+        Ok(())
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct ChannelFailure {
+    pub recipient_channel: u32,
+}
+
+impl Packet for ChannelFailure {
+    const MESSAGE_NUMBER: u8 = 100;
+    const MESSAGE_NAME: &'static str = "SSH_MSG_CHANNEL_FAILURE";
+}
+
+impl PacketEncodable for ChannelFailure {
+    fn write_into(&self, encoder: &mut PacketEncoder) -> anyhow::Result<()> {
+        encoder.write_u32(self.recipient_channel);
+        Ok(())
     }
 }
 

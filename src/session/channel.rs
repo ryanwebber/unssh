@@ -25,12 +25,17 @@ impl RemoteID {
 
 pub struct Channel {
     id: RemoteID,
+    env: Vec<(String, String)>,
     pty: Option<Pty>,
 }
 
 impl Channel {
     pub fn new(id: RemoteID) -> Self {
-        Self { id, pty: None }
+        Self {
+            id,
+            env: Vec::new(),
+            pty: None,
+        }
     }
 
     pub fn remote_id(&self) -> RemoteID {
@@ -41,6 +46,10 @@ impl Channel {
         if let Some(pty) = self.pty {
             pty.close();
         }
+    }
+
+    pub fn set_env(&mut self, name: String, value: String) {
+        self.env.push((name, value));
     }
 
     pub fn open_pty(&mut self, size: PtySize) -> anyhow::Result<()> {
@@ -62,7 +71,11 @@ impl Channel {
 
         tracing::info!("Spawning shell: {}", shell);
 
-        let cmd = smol::process::Command::new(&shell);
+        let mut cmd = smol::process::Command::new(&shell);
+        for (name, value) in &self.env {
+            cmd.env(name, value);
+        }
+
         pty.spawn_command(cmd, self.id, tx)?;
 
         Ok(())

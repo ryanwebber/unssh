@@ -296,8 +296,8 @@ impl ConnectionEventLoop {
                             };
 
                             let response: anyhow::Result<()> = match &msg.request_type {
-                                packet::ChannelRequestType::Env { .. } => {
-                                    // TODO: Support environment variables
+                                packet::ChannelRequestType::Env { name, value } => {
+                                    channel.set_env(name.clone(), value.clone());
                                     Ok(())
                                 }
                                 packet::ChannelRequestType::Exec { .. } => {

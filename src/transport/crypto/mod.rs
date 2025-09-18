@@ -17,6 +17,5 @@ pub trait MacVerification: Send {
 }
 
 pub trait MacSigner: Send {
-    fn len(&self) -> usize;
     fn compute(&mut self, seq_num: u32, packet: &[u8]) -> anyhow::Result<Vec<u8>>;
 }

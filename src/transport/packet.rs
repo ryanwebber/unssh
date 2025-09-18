@@ -420,6 +420,48 @@ impl PacketEncodable for ChannelData {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+pub struct ChannelEof {
+    pub recipient_channel: u32,
+}
+
+impl Packet for ChannelEof {
+    const MESSAGE_NUMBER: u8 = 96;
+    const MESSAGE_NAME: &'static str = "SSH_MSG_CHANNEL_EOF";
+}
+
+impl PacketEncodable for ChannelEof {
+    fn write_into(&self, encoder: &mut PacketEncoder) -> anyhow::Result<()> {
+        encoder.write_u32(self.recipient_channel);
+        Ok(())
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct ChannelClose {
+    pub recipient_channel: u32,
+}
+
+impl Packet for ChannelClose {
+    const MESSAGE_NUMBER: u8 = 97;
+    const MESSAGE_NAME: &'static str = "SSH_MSG_CHANNEL_CLOSE";
+}
+
+impl PacketEncodable for ChannelClose {
+    fn write_into(&self, encoder: &mut PacketEncoder) -> anyhow::Result<()> {
+        encoder.write_u32(self.recipient_channel);
+        Ok(())
+    }
+}
+
+impl PacketDecodable for ChannelClose {
+    fn read_from<'a>(decoder: &mut PacketDecoder<'a>) -> anyhow::Result<Self> {
+        Ok(Self {
+            recipient_channel: decoder.read_u32()?,
+        })
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
 pub struct ChannelRequest {
     pub recipient_channel: u32,
     pub request_type: ChannelRequestType,

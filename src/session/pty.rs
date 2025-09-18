@@ -50,6 +50,15 @@ impl Pty {
         })
     }
 
+    pub fn close(self) {
+        match self.state {
+            PtyState::Running { task, .. } => {
+                _ = task.cancel();
+            }
+            _ => {}
+        }
+    }
+
     pub fn spawn_command(
         &mut self,
         mut cmd: Command,
@@ -113,7 +122,16 @@ impl Pty {
                 }
             }
 
-            child.status().await?;
+            let status = child.status().await?;
+
+            tracing::info!(
+                "PTY command exited: {:?} (channel = {:?})",
+                status.code(),
+                channel
+            );
+
+            // Notify that the channel is closed
+            tx.send(server::Event::PtyClosed { channel }).await?;
 
             Ok(())
         });

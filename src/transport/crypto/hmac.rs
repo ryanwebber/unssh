@@ -39,10 +39,6 @@ impl MacVerification for HmacSha256 {
 }
 
 impl MacSigner for HmacSha256 {
-    fn len(&self) -> usize {
-        32
-    }
-
     fn compute(&mut self, seq_num: u32, packet: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.compute_impl(seq_num, packet)
     }

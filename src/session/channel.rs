@@ -37,6 +37,12 @@ impl Channel {
         self.id
     }
 
+    pub fn close(self) {
+        if let Some(pty) = self.pty {
+            pty.close();
+        }
+    }
+
     pub fn open_pty(&mut self, size: PtySize) -> anyhow::Result<()> {
         if self.pty.is_none() {
             let pty = Pty::try_open(size)?;

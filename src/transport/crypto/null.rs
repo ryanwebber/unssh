@@ -25,10 +25,6 @@ impl DecryptionCipher for Null {
 }
 
 impl MacSigner for Null {
-    fn len(&self) -> usize {
-        0
-    }
-
     fn compute(&mut self, _seq_num: u32, _packet: &[u8]) -> anyhow::Result<Vec<u8>> {
         Ok(Vec::new())
     }

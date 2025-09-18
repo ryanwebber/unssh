@@ -273,7 +273,7 @@ impl ConnectionEventLoop {
                             tracing::info!("Received channel request: {:#?}", msg);
 
                             let channel = match session
-                                .channel_mut(&&channel::LocalID(msg.recipient_channel))
+                                .channel_mut(channel::LocalID(msg.recipient_channel))
                             {
                                 Some(chan) => chan,
                                 None => {
@@ -357,7 +357,7 @@ impl ConnectionEventLoop {
                             tracing::info!("Received channel data: {:#?}", msg);
 
                             let channel = match session
-                                .channel_mut(&&channel::LocalID(msg.recipient_channel))
+                                .channel_mut(channel::LocalID(msg.recipient_channel))
                             {
                                 Some(chan) => chan,
                                 None => {
@@ -395,6 +395,19 @@ impl ConnectionEventLoop {
                                 ))?;
                             }
                         }
+                        packet::ChannelClose::MESSAGE_NUMBER => {
+                            let msg: packet::ChannelClose = payload.try_unpack()?;
+                            tracing::info!("Received channel close: {:#?}", msg);
+
+                            let local_id = channel::LocalID(msg.recipient_channel);
+                            if session.close_channel(local_id) {
+                                // Acknowledge the close
+                                self.send(&packet::ChannelClose {
+                                    recipient_channel: msg.recipient_channel,
+                                })
+                                .await?;
+                            }
+                        }
                         _ => {
                             tracing::info!(
                                 "Received unhandled packet type: {}",
@@ -416,7 +429,33 @@ impl ConnectionEventLoop {
                         }
                     }
                 }
-                Event::PtyOutput { data, channel, .. } => {
+                Event::PtyClosed { channel } => {
+                    tracing::info!("PTY closed for channel {:?}", channel);
+
+                    // Send EOF
+                    self.send(&packet::ChannelEof {
+                        recipient_channel: channel.as_u32(),
+                    })
+                    .await?;
+
+                    // Send close
+                    self.send(&packet::ChannelClose {
+                        recipient_channel: channel.as_u32(),
+                    })
+                    .await?;
+
+                    if let Some(local_id) = session.find_local_id(channel) {
+                        session.close_channel(local_id);
+                    }
+                }
+                Event::PtyOutput {
+                    data,
+                    channel,
+                    stream,
+                } => {
+                    // TODO: Handle stderr vs stdout
+                    _ = stream;
+
                     self.send(&packet::ChannelData {
                         recipient_channel: channel.as_u32(),
                         data: OwnedByteString { bytes: data },
@@ -437,6 +476,9 @@ pub enum Event {
     PacketReceived {
         payload: PacketPayload,
     },
+    PtyClosed {
+        channel: channel::RemoteID,
+    },
     PtyOutput {
         data: Vec<u8>,
         channel: channel::RemoteID,
@@ -447,5 +489,4 @@ pub enum Event {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OutputStream {
     Stdout,
-    Stderr,
 }

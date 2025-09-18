@@ -72,6 +72,11 @@ impl Channel {
         tracing::info!("Spawning shell: {}", shell);
 
         let mut cmd = smol::process::Command::new(&shell);
+
+        if let Some(home) = std::env::var_os("HOME") {
+            cmd.current_dir(home);
+        }
+
         for (name, value) in &self.env {
             cmd.env(name, value);
         }

@@ -1,8 +1,29 @@
-use smol::io::AsyncWrite;
+use std::os::fd::OwnedFd;
 
-pub use portable_pty::CommandBuilder;
+use smol::{
+    io::{AsyncReadExt, AsyncWrite},
+    process::Command,
+};
 
-pub struct Pty {}
+use crate::{
+    server::{self, OutputStream},
+    session::channel::RemoteID,
+};
+
+pub struct Pty {
+    state: PtyState,
+}
+
+pub enum PtyState {
+    Ready {
+        slave_fd: OwnedFd,
+        master_fd: OwnedFd,
+    },
+    Running {
+        task: smol::Task<anyhow::Result<()>>,
+        writer: Box<dyn AsyncWrite + Send + Unpin>,
+    },
+}
 
 pub struct PtySize {
     pub rows: u16,
@@ -12,16 +33,104 @@ pub struct PtySize {
 }
 
 impl Pty {
-    pub fn try_open(_: PtySize) -> anyhow::Result<Self> {
-        Ok(Pty {})
+    pub fn try_open(size: PtySize) -> anyhow::Result<Self> {
+        let size = nix::pty::Winsize {
+            ws_row: size.rows,
+            ws_col: size.cols,
+            ws_xpixel: size.pixel_width,
+            ws_ypixel: size.pixel_height,
+        };
+
+        let pair = nix::pty::openpty(Some(&size), None)?;
+        Ok(Self {
+            state: PtyState::Ready {
+                slave_fd: pair.slave,
+                master_fd: pair.master,
+            },
+        })
     }
 
-    pub fn spawn_command(&mut self, _: CommandBuilder) -> anyhow::Result<()> {
+    pub fn spawn_command(
+        &mut self,
+        mut cmd: Command,
+        channel: RemoteID,
+        tx: smol::channel::Sender<server::Event>,
+    ) -> anyhow::Result<()> {
+        let (slave_fd, master_fd) = match &self.state {
+            PtyState::Ready {
+                slave_fd,
+                master_fd,
+            } => (slave_fd, master_fd),
+            PtyState::Running { .. } => {
+                anyhow::bail!("PTY is already running a command");
+            }
+        };
+
+        // Spawn the shell command
+        let mut child = cmd
+            .stderr(slave_fd.try_clone()?)
+            .stdout(slave_fd.try_clone()?)
+            .stdin(slave_fd.try_clone()?)
+            .spawn()?;
+
+        let reader = {
+            let file = std::fs::File::from(master_fd.try_clone()?);
+            smol::Async::new(file)?
+        };
+
+        let writer = {
+            let file = std::fs::File::from(master_fd.try_clone()?);
+            smol::Async::new(file)?
+        };
+
+        // Spawn a task to read from the PTY and send output events
+        let task = smol::spawn(async move {
+            let mut reader = smol::io::BufReader::new(reader);
+            let mut buf = [0u8; 1024];
+            loop {
+                match reader.read(&mut buf).await {
+                    Ok(0) => {
+                        // EOF
+                        break;
+                    }
+                    Ok(n) => {
+                        let data = buf[..n].to_vec();
+                        let event = server::Event::PtyOutput {
+                            channel,
+                            data,
+                            stream: OutputStream::Stdout,
+                        };
+
+                        if tx.send(event).await.is_err() {
+                            // Receiver dropped
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Error reading from PTY: {}", e);
+                        break;
+                    }
+                }
+            }
+
+            child.status().await?;
+
+            Ok(())
+        });
+
+        self.state = PtyState::Running {
+            task,
+            writer: Box::new(writer),
+        };
+
         Ok(())
     }
 
     pub fn writer_mut(&mut self) -> Option<&mut (dyn AsyncWrite + Send + Unpin)> {
-        todo!()
+        match &mut self.state {
+            PtyState::Running { writer, .. } => Some(writer.as_mut()),
+            _ => None,
+        }
     }
 }
 

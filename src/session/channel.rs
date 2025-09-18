@@ -1,4 +1,9 @@
-use crate::session::pty::{self, Pty, PtySize};
+use smol::io::AsyncWrite;
+
+use crate::{
+    server,
+    session::pty::{Pty, PtySize},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LocalID(pub u32);
@@ -42,19 +47,22 @@ impl Channel {
         }
     }
 
-    pub fn spawn_shell(&mut self) -> anyhow::Result<()> {
+    pub fn spawn_shell(&mut self, tx: smol::channel::Sender<server::Event>) -> anyhow::Result<()> {
         let Some(ref mut pty) = self.pty else {
             anyhow::bail!("PTY not opened");
         };
 
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        let cmd = pty::CommandBuilder::new(&shell);
-        pty.spawn_command(cmd)?;
+
+        tracing::info!("Spawning shell: {}", shell);
+
+        let cmd = smol::process::Command::new(&shell);
+        pty.spawn_command(cmd, self.id, tx)?;
 
         Ok(())
     }
 
-    pub fn pty_writer_mut(&mut self) -> Option<&mut (dyn smol::io::AsyncWrite + Send + Unpin)> {
+    pub fn pty_writer_mut(&mut self) -> Option<&mut (dyn AsyncWrite + Send + Unpin)> {
         self.pty.as_mut().and_then(|pty| pty.writer_mut())
     }
 }

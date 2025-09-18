@@ -316,7 +316,9 @@ impl ConnectionEventLoop {
                                     pixel_width: *width_px as u16,
                                     pixel_height: *height_px as u16,
                                 }),
-                                packet::ChannelRequestType::Shell => channel.spawn_shell(),
+                                packet::ChannelRequestType::Shell => {
+                                    channel.spawn_shell(self.tx.clone())
+                                }
                                 packet::ChannelRequestType::Subsystem { .. } => {
                                     // TODO: Support subsystems like SFTP
                                     Err(anyhow::anyhow!("Subsystems are not implemented yet"))
@@ -415,20 +417,8 @@ impl ConnectionEventLoop {
                     }
                 }
                 Event::PtyOutput { data, channel, .. } => {
-                    let channel = match session.channel_mut(&&channel::LocalID(channel.as_u32())) {
-                        Some(chan) => chan,
-                        None => {
-                            tracing::warn!(
-                                "Received PTY output for unknown channel: {}",
-                                channel.as_u32()
-                            );
-
-                            continue;
-                        }
-                    };
-
                     self.send(&packet::ChannelData {
-                        recipient_channel: channel.remote_id().as_u32(),
+                        recipient_channel: channel.as_u32(),
                         data: OwnedByteString { bytes: data },
                     })
                     .await?;
@@ -436,12 +426,14 @@ impl ConnectionEventLoop {
             }
         }
 
+        tracing::info!("Event loop exiting");
+
         Ok(())
     }
 }
 
 #[derive(Clone)]
-enum Event {
+pub enum Event {
     PacketReceived {
         payload: PacketPayload,
     },
@@ -453,7 +445,7 @@ enum Event {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum OutputStream {
+pub enum OutputStream {
     Stdout,
     Stderr,
 }
